@@ -6,11 +6,17 @@ description: List the user's recent Granola meetings (today, yesterday, last N d
 
 List recent Granola meetings via the `granola` CLI.
 
-## Prerequisite check
+## Preflight: install check
 
-Before doing anything, run `command -v granola` via Bash. If it returns nothing:
+Before doing anything else, run `command -v granola` via Bash.
 
-> Stop. Tell the user: "The `granola` CLI isn't installed. Install with `brew install tmcinerney/tap/granola-cli` (or `cargo install granola-cli`), then run `granola auth login` once."
+- **Found** → continue with the main flow below.
+- **Not found** → ask the user:
+  > "The `granola` CLI isn't installed. Want me to install it via Homebrew now? (`brew install tmcinerney/tap/granola-cli`)"
+  - **Yes** → run `brew install tmcinerney/tap/granola-cli` via Bash. Once it succeeds, tell the user: "Installed. If this is your first time using it, run `granola auth login` to import credentials from the Granola desktop app." Then continue with the main flow.
+  - **No** → suggest the Cargo alternative `cargo install --git https://github.com/tmcinerney/granola-cli` and stop. Don't proceed.
+
+Auth errors from the CLI itself (`unauthenticated` / `stale_credentials`) are handled in **Error handling** below, not here.
 
 ## How to invoke the CLI
 

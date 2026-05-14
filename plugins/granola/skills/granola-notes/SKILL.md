@@ -6,11 +6,17 @@ description: Fetch the markdown notes from a specific Granola meeting. Use when 
 
 Fetch and display meeting notes as markdown.
 
-## Prerequisite check
+## Preflight: install check
 
-Run `command -v granola` first. If missing:
+Run `command -v granola` first.
 
-> Stop. Tell the user: "The `granola` CLI isn't installed. Install with `brew install tmcinerney/tap/granola-cli`, then run `granola auth login` once."
+- **Found** → continue.
+- **Not found** → ask the user:
+  > "The `granola` CLI isn't installed. Want me to install it via Homebrew now? (`brew install tmcinerney/tap/granola-cli`)"
+  - **Yes** → run `brew install tmcinerney/tap/granola-cli`. Once it succeeds, tell the user: "Installed. If this is your first time using it, run `granola auth login` to import credentials from the Granola desktop app." Then proceed.
+  - **No** → suggest `cargo install --git https://github.com/tmcinerney/granola-cli` and stop.
+
+Auth errors are handled in **Error handling** below.
 
 ## Workflow
 

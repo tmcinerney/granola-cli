@@ -1,7 +1,7 @@
 {
   "name": "granola",
   "description": "Skills for working with Granola meeting notes via the granola CLI",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": {
     "name": "Travers McInerney"
   },
