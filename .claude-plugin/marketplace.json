@@ -1,0 +1,13 @@
+{
+  "name": "tmcinerney-granola",
+  "owner": {
+    "name": "Travers McInerney"
+  },
+  "plugins": [
+    {
+      "name": "granola",
+      "source": "./plugins/granola",
+      "description": "Skills for working with Granola meeting notes via the granola CLI"
+    }
+  ]
+}
