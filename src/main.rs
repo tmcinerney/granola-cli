@@ -96,7 +96,7 @@ struct ListArgs {
 
 #[derive(Args, Clone)]
 struct IdArgs {
-    /// Meeting (document) ID
+    /// Meeting (document) ID or unique prefix from `meeting list`
     id: String,
     #[command(flatten)]
     out: OutputOpts,
@@ -104,7 +104,7 @@ struct IdArgs {
 
 #[derive(Args, Clone)]
 struct ExportArgs {
-    /// Meeting (document) ID
+    /// Meeting (document) ID or unique prefix from `meeting list`
     id: String,
     /// Output file path (default: stdout)
     #[arg(short = 'f', long)]
@@ -408,6 +408,47 @@ fn in_date_range(m: &Value, since: Option<DateTime<Utc>>, until: Option<DateTime
     true
 }
 
+fn looks_like_full_meeting_id(id: &str) -> bool {
+    id.len() == 36 && id.chars().filter(|c| *c == '-').count() == 4
+}
+
+fn resolve_meeting_id_from_documents(raw_id: &str, meetings: &[Value]) -> Result<String> {
+    let trimmed = raw_id.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("meeting ID cannot be empty");
+    }
+    if looks_like_full_meeting_id(trimmed) {
+        return Ok(trimmed.to_string());
+    }
+
+    let matches: Vec<String> = meetings
+        .iter()
+        .filter_map(|m| m.get("id").and_then(Value::as_str))
+        .filter(|id| id.starts_with(trimmed))
+        .map(str::to_string)
+        .collect();
+
+    match matches.as_slice() {
+        [only] => Ok(only.clone()),
+        [] => anyhow::bail!(
+            "meeting ID `{trimmed}` did not match any recent meeting. Use the full UUID from \
+             `granola meeting list --output json` or a unique prefix from `granola meeting list`."
+        ),
+        _ => anyhow::bail!(
+            "meeting ID `{trimmed}` matched multiple recent meetings. Use the full UUID from \
+             `granola meeting list --output json`."
+        ),
+    }
+}
+
+// AIDEV-NOTE: The table view intentionally shortens IDs to 8 characters for
+// readability. Content commands must resolve that prefix back to the full UUID
+// before calling Granola's document endpoints, or the API returns HTTP 400.
+fn resolve_meeting_id(client: &api::Client, raw_id: &str) -> Result<String> {
+    let meetings = fetch_meetings_merged(client, true)?;
+    resolve_meeting_id_from_documents(raw_id, &meetings)
+}
+
 /// Fetch the full document via `/v1/get-documents-batch` with
 /// `include_last_viewed_panel: true`. This is the most reliable single-doc
 /// fetch path — `get-document-metadata` returns a sparse view on many
@@ -424,13 +465,21 @@ fn fetch_full_document(client: &api::Client, id: &str) -> Result<Value, api::Err
 }
 
 fn meeting_view(args: &IdArgs) -> Result<()> {
-    let doc = api::with_token_refresh(|c| fetch_full_document(c, &args.id))?;
+    let doc = api::with_token_refresh(|c| {
+        let id =
+            resolve_meeting_id(c, &args.id).map_err(|e| api::Error::Transport(e.to_string()))?;
+        fetch_full_document(c, &id)
+    })?;
     output::emit(&doc, args.out.output);
     Ok(())
 }
 
 fn meeting_notes(args: &IdArgs) -> Result<()> {
-    let doc = api::with_token_refresh(|c| fetch_full_document(c, &args.id))?;
+    let doc = api::with_token_refresh(|c| {
+        let id =
+            resolve_meeting_id(c, &args.id).map_err(|e| api::Error::Transport(e.to_string()))?;
+        fetch_full_document(c, &id)
+    })?;
     let notes_doc = doc
         .pointer("/last_viewed_panel/content")
         .or_else(|| doc.get("notes"))
@@ -455,7 +504,11 @@ fn meeting_notes(args: &IdArgs) -> Result<()> {
 }
 
 fn meeting_transcript(args: &IdArgs) -> Result<()> {
-    let transcript = api::with_token_refresh(|c| c.get_document_transcript(&args.id))?;
+    let transcript = api::with_token_refresh(|c| {
+        let id =
+            resolve_meeting_id(c, &args.id).map_err(|e| api::Error::Transport(e.to_string()))?;
+        c.get_document_transcript(&id)
+    })?;
     match args.out.output {
         Format::Json | Format::Yaml => output::emit(&transcript, args.out.output),
         _ => {
@@ -476,7 +529,10 @@ fn meeting_transcript(args: &IdArgs) -> Result<()> {
 }
 
 fn meeting_export(args: &ExportArgs) -> Result<()> {
-    let doc = api::with_token_refresh(|c| fetch_full_document(c, &args.id))?;
+    let resolved_id = api::with_token_refresh(|c| {
+        resolve_meeting_id(c, &args.id).map_err(|e| api::Error::Transport(e.to_string()))
+    })?;
+    let doc = api::with_token_refresh(|c| fetch_full_document(c, &resolved_id))?;
     let title = doc
         .get("title")
         .and_then(Value::as_str)
@@ -500,7 +556,7 @@ fn meeting_export(args: &ExportArgs) -> Result<()> {
     let mut out = format!("# {title}\n\n{notes}\n");
 
     if args.include_transcript {
-        let transcript = api::with_token_refresh(|c| c.get_document_transcript(&args.id))?;
+        let transcript = api::with_token_refresh(|c| c.get_document_transcript(&resolved_id))?;
         out.push_str("\n## Transcript\n\n");
         if let Some(arr) = transcript.as_array() {
             for seg in arr {
@@ -523,4 +579,55 @@ fn meeting_export(args: &ExportArgs) -> Result<()> {
         None => print!("{out}"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_meeting_id_from_documents;
+    use serde_json::json;
+
+    #[test]
+    fn keeps_full_meeting_uuid() {
+        let meetings = vec![json!({ "id": "bdb68fba-fdf4-4b97-b7e2-b63deca0f234" })];
+        let resolved =
+            resolve_meeting_id_from_documents("bdb68fba-fdf4-4b97-b7e2-b63deca0f234", &meetings)
+                .expect("full id should be preserved");
+        assert_eq!(resolved, "bdb68fba-fdf4-4b97-b7e2-b63deca0f234");
+    }
+
+    #[test]
+    fn resolves_unique_short_prefix() {
+        let meetings = vec![
+            json!({ "id": "bdb68fba-fdf4-4b97-b7e2-b63deca0f234" }),
+            json!({ "id": "fa148cc7-b834-4dfd-9a58-8f93fb069022" }),
+        ];
+        let resolved = resolve_meeting_id_from_documents("bdb68fba", &meetings)
+            .expect("short prefix should resolve");
+        assert_eq!(resolved, "bdb68fba-fdf4-4b97-b7e2-b63deca0f234");
+    }
+
+    #[test]
+    fn errors_on_ambiguous_prefix() {
+        let meetings = vec![
+            json!({ "id": "bdb68fba-fdf4-4b97-b7e2-b63deca0f234" }),
+            json!({ "id": "bdb68fba-1111-4b97-b7e2-b63deca0f235" }),
+        ];
+        let err = resolve_meeting_id_from_documents("bdb68fba", &meetings)
+            .expect_err("ambiguous prefix should fail");
+        assert!(
+            err.to_string().contains("matched multiple recent meetings"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn errors_on_missing_prefix() {
+        let meetings = vec![json!({ "id": "bdb68fba-fdf4-4b97-b7e2-b63deca0f234" })];
+        let err = resolve_meeting_id_from_documents("deadbeef", &meetings)
+            .expect_err("missing prefix should fail");
+        assert!(
+            err.to_string().contains("did not match any recent meeting"),
+            "unexpected error: {err}"
+        );
+    }
 }
