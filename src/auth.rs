@@ -9,8 +9,17 @@
 //! in a future release, only new logins break — existing installs keep
 //! working until their refresh token chain dies.
 
+use aes::Aes128;
+use aes_gcm::aead::{AeadInPlace, KeyInit};
+use aes_gcm::{Aes256Gcm, Nonce, Tag};
+use base64::prelude::{Engine as _, BASE64_STANDARD};
+use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+use cbc::Decryptor;
+use pbkdf2::pbkdf2_hmac;
+use sha1::Sha1;
 use std::fs::{File, OpenOptions};
 use std::io;
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -21,6 +30,19 @@ const SERVICE_NAME: &str = "com.granola.cli";
 const ACCOUNT_NAME: &str = "credentials";
 const DEFAULT_CLIENT_ID: &str = "client_GranolaMac";
 const WORKOS_AUTH_URL: &str = "https://api.workos.com/user_management/authenticate";
+const GRANOLA_SAFE_STORAGE_SERVICE: &str = "Granola Safe Storage";
+const GRANOLA_SAFE_STORAGE_ACCOUNT: &str = "Granola Key";
+const MAC_SAFE_STORAGE_PREFIX: &[u8] = b"v10";
+const MAC_SAFE_STORAGE_SALT: &[u8] = b"saltysalt";
+const MAC_SAFE_STORAGE_ITERATIONS: u32 = 1003;
+const MAC_SAFE_STORAGE_KEY_LENGTH: usize = 16;
+const MAC_SAFE_STORAGE_IV: [u8; 16] = [b' '; 16];
+const GRANOLA_STORAGE_KEY_LENGTH: usize = 32;
+const GRANOLA_STORAGE_IV_LENGTH: usize = 12;
+const GRANOLA_STORAGE_AUTH_TAG_LENGTH: usize = 16;
+
+type Aes128CbcDec = Decryptor<Aes128>;
+type CredentialParser = fn(&str) -> Option<Credentials>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -38,6 +60,8 @@ pub enum Error {
     RefreshRejected { status: u16 },
     #[error("could not locate Granola desktop credentials — tried {tried:?}")]
     NoDesktopCredentials { tried: Vec<PathBuf> },
+    #[error("could not read encrypted Granola desktop credentials: {0}")]
+    EncryptedDesktopCredentials(String),
     #[error("could not determine user home/cache directory")]
     NoHomeDir,
 }
@@ -214,6 +238,193 @@ pub fn supabase_path() -> Option<PathBuf> {
     granola_file("supabase.json")
 }
 
+pub fn encrypted_stored_accounts_path() -> Option<PathBuf> {
+    granola_file("stored-accounts.json.enc")
+}
+
+pub fn encrypted_supabase_path() -> Option<PathBuf> {
+    granola_file("supabase.json.enc")
+}
+
+pub fn storage_dek_path() -> Option<PathBuf> {
+    granola_file("storage.dek")
+}
+
+fn decrypt_mac_safe_storage_value(encrypted_value: &[u8], password: &str) -> Result<String, Error> {
+    let payload = encrypted_value
+        .strip_prefix(MAC_SAFE_STORAGE_PREFIX)
+        .unwrap_or(encrypted_value);
+
+    let mut key = [0_u8; MAC_SAFE_STORAGE_KEY_LENGTH];
+    pbkdf2_hmac::<Sha1>(
+        password.as_bytes(),
+        MAC_SAFE_STORAGE_SALT,
+        MAC_SAFE_STORAGE_ITERATIONS,
+        &mut key,
+    );
+
+    let cipher = Aes128CbcDec::new_from_slices(&key, &MAC_SAFE_STORAGE_IV).map_err(|e| {
+        Error::EncryptedDesktopCredentials(format!("invalid safe-storage cipher parameters: {e}"))
+    })?;
+    let decrypted = cipher
+        .decrypt_padded_vec_mut::<Pkcs7>(payload)
+        .map_err(|e| {
+            Error::EncryptedDesktopCredentials(format!(
+                "could not decrypt Granola safe-storage key: {e}"
+            ))
+        })?;
+
+    String::from_utf8(decrypted).map_err(|e| {
+        Error::EncryptedDesktopCredentials(format!(
+            "Granola safe-storage key was not valid UTF-8: {e}"
+        ))
+    })
+}
+
+fn decrypt_granola_storage(encrypted_value: &[u8], dek: &[u8]) -> Result<String, Error> {
+    if dek.len() != GRANOLA_STORAGE_KEY_LENGTH {
+        return Err(Error::EncryptedDesktopCredentials(format!(
+            "invalid Granola storage key length: expected {GRANOLA_STORAGE_KEY_LENGTH} bytes, got {}",
+            dek.len()
+        )));
+    }
+    if encrypted_value.len() < GRANOLA_STORAGE_IV_LENGTH + GRANOLA_STORAGE_AUTH_TAG_LENGTH {
+        return Err(Error::EncryptedDesktopCredentials(
+            "encrypted Granola storage payload was too short".into(),
+        ));
+    }
+
+    let iv = &encrypted_value[..GRANOLA_STORAGE_IV_LENGTH];
+    let auth_tag = &encrypted_value[encrypted_value.len() - GRANOLA_STORAGE_AUTH_TAG_LENGTH..];
+    let encrypted_payload = &encrypted_value
+        [GRANOLA_STORAGE_IV_LENGTH..encrypted_value.len() - GRANOLA_STORAGE_AUTH_TAG_LENGTH];
+
+    let cipher = Aes256Gcm::new_from_slice(dek).map_err(|e| {
+        Error::EncryptedDesktopCredentials(format!(
+            "invalid Granola storage cipher parameters: {e}"
+        ))
+    })?;
+    let mut decrypted = encrypted_payload.to_vec();
+    cipher
+        .decrypt_in_place_detached(
+            Nonce::from_slice(iv),
+            b"",
+            &mut decrypted,
+            Tag::from_slice(auth_tag),
+        )
+        .map_err(|e| {
+            Error::EncryptedDesktopCredentials(format!(
+                "could not decrypt Granola desktop storage: {e}"
+            ))
+        })?;
+
+    String::from_utf8(decrypted).map_err(|e| {
+        Error::EncryptedDesktopCredentials(format!(
+            "Granola desktop storage was not valid UTF-8: {e}"
+        ))
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn read_granola_safe_storage_password() -> Result<String, Error> {
+    let entry = keyring::Entry::new(GRANOLA_SAFE_STORAGE_SERVICE, GRANOLA_SAFE_STORAGE_ACCOUNT)?;
+    match entry.get_password() {
+        Ok(password) => Ok(password),
+        Err(keyring::Error::NoEntry) => Err(Error::EncryptedDesktopCredentials(
+            "missing Keychain item `Granola Safe Storage` / `Granola Key`".into(),
+        )),
+        Err(e) => Err(Error::EncryptedDesktopCredentials(format!(
+            "could not read Keychain item `Granola Safe Storage` / `Granola Key`: {e}"
+        ))),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn read_granola_storage_dek(dek_path: &Path) -> Result<Vec<u8>, Error> {
+    let encrypted_dek = std::fs::read(dek_path)?;
+    let password = read_granola_safe_storage_password()?;
+    let dek_b64 = decrypt_mac_safe_storage_value(&encrypted_dek, &password)?;
+    let dek = BASE64_STANDARD.decode(dek_b64.trim_end()).map_err(|e| {
+        Error::EncryptedDesktopCredentials(format!("Granola storage key was not valid base64: {e}"))
+    })?;
+    if dek.len() != GRANOLA_STORAGE_KEY_LENGTH {
+        return Err(Error::EncryptedDesktopCredentials(format!(
+            "Granola storage key decoded to {} bytes; expected {GRANOLA_STORAGE_KEY_LENGTH}",
+            dek.len()
+        )));
+    }
+    Ok(dek)
+}
+
+#[cfg(target_os = "macos")]
+fn load_encrypted_credentials_from_file(
+    tried: &mut Vec<PathBuf>,
+) -> Result<Option<Credentials>, Error> {
+    let mut candidates: Vec<(PathBuf, CredentialParser)> = Vec::new();
+
+    if let Some(p) = encrypted_stored_accounts_path() {
+        tried.push(p.clone());
+        candidates.push((p, parse_stored_accounts));
+    }
+    if let Some(p) = encrypted_supabase_path() {
+        tried.push(p.clone());
+        candidates.push((p, parse_supabase));
+    }
+
+    let existing: Vec<(PathBuf, CredentialParser)> = candidates
+        .into_iter()
+        .filter(|(p, _)| p.is_file())
+        .collect();
+    if existing.is_empty() {
+        return Ok(None);
+    }
+
+    let dek_path = storage_dek_path().ok_or(Error::NoHomeDir)?;
+    tried.push(dek_path.clone());
+
+    // AIDEV-NOTE: Current Granola macOS builds keep plaintext auth files frozen
+    // while rotating live tokens in *.enc files. If encrypted files exist, do
+    // not silently fall back to plaintext or we can re-import a dead refresh token.
+    let dek = read_granola_storage_dek(&dek_path)?;
+    let mut failures = Vec::new();
+
+    for (path, parser) in existing {
+        let encrypted = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                failures.push(format!("{}: {e}", path.display()));
+                continue;
+            }
+        };
+        let decrypted = match decrypt_granola_storage(&encrypted, &dek) {
+            Ok(content) => content,
+            Err(e) => {
+                failures.push(format!("{}: {e}", path.display()));
+                continue;
+            }
+        };
+        if let Some(creds) = parser(&decrypted) {
+            return Ok(Some(creds));
+        }
+        failures.push(format!(
+            "{} decrypted but did not match the expected credential shape",
+            path.display()
+        ));
+    }
+
+    Err(Error::EncryptedDesktopCredentials(format!(
+        "found encrypted Granola desktop credentials but could not import them: {}",
+        failures.join("; ")
+    )))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn load_encrypted_credentials_from_file(
+    _tried: &mut Vec<PathBuf>,
+) -> Result<Option<Credentials>, Error> {
+    Ok(None)
+}
+
 /// Read credentials from the Granola desktop app.
 ///
 /// Tries `stored-accounts.json` first (Granola desktop ≥7.162), falls back
@@ -221,6 +432,10 @@ pub fn supabase_path() -> Option<PathBuf> {
 /// credentials live in the keychain.
 pub fn load_credentials_from_file() -> Result<Credentials, Error> {
     let mut tried = Vec::new();
+
+    if let Some(creds) = load_encrypted_credentials_from_file(&mut tried)? {
+        return Ok(creds);
+    }
 
     if let Some(p) = stored_accounts_path() {
         tried.push(p.clone());
@@ -315,6 +530,43 @@ pub fn refresh_access_token() -> Result<Credentials, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aes_gcm::aead::AeadInPlace;
+    use aes_gcm::Aes256Gcm;
+    use base64::prelude::BASE64_STANDARD;
+    use cbc::cipher::BlockEncryptMut;
+    use cbc::Encryptor;
+
+    type Aes128CbcEnc = Encryptor<Aes128>;
+
+    fn encrypt_mac_safe_storage_value(value: &str, password: &str) -> Vec<u8> {
+        let mut key = [0_u8; MAC_SAFE_STORAGE_KEY_LENGTH];
+        pbkdf2_hmac::<Sha1>(
+            password.as_bytes(),
+            MAC_SAFE_STORAGE_SALT,
+            MAC_SAFE_STORAGE_ITERATIONS,
+            &mut key,
+        );
+
+        let cipher = Aes128CbcEnc::new_from_slices(&key, &MAC_SAFE_STORAGE_IV).unwrap();
+        let mut encrypted = MAC_SAFE_STORAGE_PREFIX.to_vec();
+        encrypted.extend(cipher.encrypt_padded_vec_mut::<Pkcs7>(value.as_bytes()));
+        encrypted
+    }
+
+    fn encrypt_granola_storage(value: &str, dek: &[u8]) -> Vec<u8> {
+        let iv = [7_u8; GRANOLA_STORAGE_IV_LENGTH];
+        let cipher = Aes256Gcm::new_from_slice(dek).unwrap();
+        let mut encrypted = value.as_bytes().to_vec();
+        let tag = cipher
+            .encrypt_in_place_detached(Nonce::from_slice(&iv), b"", &mut encrypted)
+            .unwrap();
+
+        let mut blob = Vec::with_capacity(iv.len() + encrypted.len() + tag.len());
+        blob.extend_from_slice(&iv);
+        blob.extend_from_slice(&encrypted);
+        blob.extend_from_slice(tag.as_slice());
+        blob
+    }
 
     #[test]
     fn stored_accounts_with_stringified_inner_fields() {
@@ -416,5 +668,62 @@ mod tests {
     fn supabase_legacy_missing_refresh_token() {
         let file = serde_json::json!({ "access_token": "AT" });
         assert!(parse_supabase(&file.to_string()).is_none());
+    }
+
+    #[test]
+    fn encrypted_stored_accounts_round_trip() {
+        let dek = vec![0xAB; GRANOLA_STORAGE_KEY_LENGTH];
+        let dek_b64 = BASE64_STANDARD.encode(&dek);
+        let wrapped_dek = encrypt_mac_safe_storage_value(&dek_b64, "test-password");
+
+        let tokens =
+            r#"{"access_token":"AT123","refresh_token":"RT123","client_id":"client_GranolaMac"}"#;
+        let accounts_str = format!(
+            r#"[{{"userId":"u1","email":"x@example.com","tokens":{}}}]"#,
+            serde_json::to_string(tokens).unwrap()
+        );
+        let file = format!(
+            r#"{{"accounts":{}}}"#,
+            serde_json::to_string(&accounts_str).unwrap()
+        );
+        let encrypted_file = encrypt_granola_storage(&file, &dek);
+
+        let unwrapped_dek_b64 =
+            decrypt_mac_safe_storage_value(&wrapped_dek, "test-password").expect("unwrap dek");
+        assert_eq!(unwrapped_dek_b64, dek_b64);
+
+        let decoded_dek = BASE64_STANDARD
+            .decode(unwrapped_dek_b64)
+            .expect("decode dek");
+        let plaintext =
+            decrypt_granola_storage(&encrypted_file, &decoded_dek).expect("decrypt storage");
+        let creds = parse_stored_accounts(&plaintext).expect("parse stored-accounts");
+
+        assert_eq!(creds.access_token, "AT123");
+        assert_eq!(creds.refresh_token, "RT123");
+        assert_eq!(creds.client_id, "client_GranolaMac");
+    }
+
+    #[test]
+    fn encrypted_supabase_round_trip_prefers_workos_tokens() {
+        let dek = vec![0xCD; GRANOLA_STORAGE_KEY_LENGTH];
+        let file = serde_json::json!({
+            "access_token": "STALE_TOP_LEVEL_ACCESS",
+            "refresh_token": "STALE_TOP_LEVEL_REFRESH",
+            "workos_tokens": serde_json::to_string(&serde_json::json!({
+                "access_token": "CURRENT_WORKOS_ACCESS",
+                "refresh_token": "CURRENT_WORKOS_REFRESH"
+            }))
+            .unwrap(),
+        });
+
+        let plaintext =
+            decrypt_granola_storage(&encrypt_granola_storage(&file.to_string(), &dek), &dek)
+                .expect("decrypt storage");
+        let creds = parse_supabase(&plaintext).expect("parse supabase");
+
+        assert_eq!(creds.access_token, "CURRENT_WORKOS_ACCESS");
+        assert_eq!(creds.refresh_token, "CURRENT_WORKOS_REFRESH");
+        assert_eq!(creds.client_id, DEFAULT_CLIENT_ID);
     }
 }

@@ -168,12 +168,12 @@ fn auth_login(opts: &OutputOpts) -> Result<()> {
     let validated = api::with_token_refresh(|c| c.get_workspaces());
     match validated {
         Ok(_) => emit_message(opts, "ok", "Credentials imported and validated"),
-        Err(api::Error::Http { status: 401, .. }) => emit_error(
+        Err(e) if is_stale_credentials_error(&e) => emit_error(
             opts,
             "stale_credentials",
             "Imported credentials were rejected by Granola. This usually means \
-             Granola desktop's credentials are stale or encrypted in a format \
-             we don't support. Try signing out and back in inside Granola desktop.",
+             Granola desktop's session is stale. Try re-importing with \
+             `granola auth login` after confirming Granola desktop is signed in.",
         ),
         Err(e) => Err(e.into()),
     }
@@ -189,7 +189,7 @@ fn auth_status(opts: &OutputOpts) -> Result<()> {
     }
     match api::with_token_refresh(|c| c.get_workspaces()) {
         Ok(_) => emit_message(opts, "ok", "Authenticated and validated"),
-        Err(api::Error::Http { status: 401, .. }) => emit_error(
+        Err(e) if is_stale_credentials_error(&e) => emit_error(
             opts,
             "stale_credentials",
             "Credentials in keychain were rejected. Run `granola auth login` to re-import.",
@@ -201,6 +201,11 @@ fn auth_status(opts: &OutputOpts) -> Result<()> {
 fn auth_logout(opts: &OutputOpts) -> Result<()> {
     auth::delete_credentials()?;
     emit_message(opts, "ok", "Logged out")
+}
+
+fn is_stale_credentials_error(err: &api::Error) -> bool {
+    matches!(err, api::Error::Http { status: 401, .. })
+        || matches!(err, api::Error::Auth(auth::Error::RefreshRejected { .. }))
 }
 
 fn emit_message(opts: &OutputOpts, code: &str, message: &str) -> Result<()> {
