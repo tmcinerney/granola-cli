@@ -9,16 +9,25 @@
 //! in a future release, only new logins break — existing installs keep
 //! working until their refresh token chain dies.
 
+#[cfg(any(target_os = "macos", test))]
 use aes::Aes128;
+#[cfg(any(target_os = "macos", test))]
 use aes_gcm::aead::{AeadInPlace, KeyInit};
+#[cfg(any(target_os = "macos", test))]
 use aes_gcm::{Aes256Gcm, Nonce, Tag};
+#[cfg(any(target_os = "macos", test))]
 use base64::prelude::{Engine as _, BASE64_STANDARD};
+#[cfg(any(target_os = "macos", test))]
 use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+#[cfg(any(target_os = "macos", test))]
 use cbc::Decryptor;
+#[cfg(any(target_os = "macos", test))]
 use pbkdf2::pbkdf2_hmac;
+#[cfg(any(target_os = "macos", test))]
 use sha1::Sha1;
 use std::fs::{File, OpenOptions};
 use std::io;
+#[cfg(target_os = "macos")]
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -30,18 +39,30 @@ const SERVICE_NAME: &str = "com.granola.cli";
 const ACCOUNT_NAME: &str = "credentials";
 const DEFAULT_CLIENT_ID: &str = "client_GranolaMac";
 const WORKOS_AUTH_URL: &str = "https://api.workos.com/user_management/authenticate";
+#[cfg(target_os = "macos")]
 const GRANOLA_SAFE_STORAGE_SERVICE: &str = "Granola Safe Storage";
+#[cfg(target_os = "macos")]
 const GRANOLA_SAFE_STORAGE_ACCOUNT: &str = "Granola Key";
+#[cfg(any(target_os = "macos", test))]
 const MAC_SAFE_STORAGE_PREFIX: &[u8] = b"v10";
+#[cfg(any(target_os = "macos", test))]
 const MAC_SAFE_STORAGE_SALT: &[u8] = b"saltysalt";
+#[cfg(any(target_os = "macos", test))]
 const MAC_SAFE_STORAGE_ITERATIONS: u32 = 1003;
+#[cfg(any(target_os = "macos", test))]
 const MAC_SAFE_STORAGE_KEY_LENGTH: usize = 16;
+#[cfg(any(target_os = "macos", test))]
 const MAC_SAFE_STORAGE_IV: [u8; 16] = [b' '; 16];
+#[cfg(any(target_os = "macos", test))]
 const GRANOLA_STORAGE_KEY_LENGTH: usize = 32;
+#[cfg(any(target_os = "macos", test))]
 const GRANOLA_STORAGE_IV_LENGTH: usize = 12;
+#[cfg(any(target_os = "macos", test))]
 const GRANOLA_STORAGE_AUTH_TAG_LENGTH: usize = 16;
 
+#[cfg(any(target_os = "macos", test))]
 type Aes128CbcDec = Decryptor<Aes128>;
+#[cfg(target_os = "macos")]
 type CredentialParser = fn(&str) -> Option<Credentials>;
 
 #[derive(Debug, thiserror::Error)]
@@ -60,6 +81,7 @@ pub enum Error {
     RefreshRejected { status: u16 },
     #[error("could not locate Granola desktop credentials — tried {tried:?}")]
     NoDesktopCredentials { tried: Vec<PathBuf> },
+    #[cfg(any(target_os = "macos", test))]
     #[error("could not read encrypted Granola desktop credentials: {0}")]
     EncryptedDesktopCredentials(String),
     #[error("could not determine user home/cache directory")]
@@ -238,18 +260,22 @@ pub fn supabase_path() -> Option<PathBuf> {
     granola_file("supabase.json")
 }
 
+#[cfg(target_os = "macos")]
 pub fn encrypted_stored_accounts_path() -> Option<PathBuf> {
     granola_file("stored-accounts.json.enc")
 }
 
+#[cfg(target_os = "macos")]
 pub fn encrypted_supabase_path() -> Option<PathBuf> {
     granola_file("supabase.json.enc")
 }
 
+#[cfg(target_os = "macos")]
 pub fn storage_dek_path() -> Option<PathBuf> {
     granola_file("storage.dek")
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn decrypt_mac_safe_storage_value(encrypted_value: &[u8], password: &str) -> Result<String, Error> {
     let payload = encrypted_value
         .strip_prefix(MAC_SAFE_STORAGE_PREFIX)
@@ -281,6 +307,7 @@ fn decrypt_mac_safe_storage_value(encrypted_value: &[u8], password: &str) -> Res
     })
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn decrypt_granola_storage(encrypted_value: &[u8], dek: &[u8]) -> Result<String, Error> {
     if dek.len() != GRANOLA_STORAGE_KEY_LENGTH {
         return Err(Error::EncryptedDesktopCredentials(format!(
@@ -530,11 +557,14 @@ pub fn refresh_access_token() -> Result<Credentials, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aes_gcm::aead::AeadInPlace;
-    use aes_gcm::Aes256Gcm;
+    use aes::Aes128;
+    use aes_gcm::aead::{AeadInPlace, KeyInit};
+    use aes_gcm::{Aes256Gcm, Nonce};
     use base64::prelude::BASE64_STANDARD;
-    use cbc::cipher::BlockEncryptMut;
+    use cbc::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
     use cbc::Encryptor;
+    use pbkdf2::pbkdf2_hmac;
+    use sha1::Sha1;
 
     type Aes128CbcEnc = Encryptor<Aes128>;
 
