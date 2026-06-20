@@ -15,7 +15,7 @@ use aes::Aes128;
 use aes_gcm::aead::{AeadInPlace, KeyInit};
 #[cfg(any(target_os = "macos", test))]
 use aes_gcm::{Aes256Gcm, Nonce, Tag};
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 #[cfg(any(target_os = "macos", test))]
 use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
@@ -561,6 +561,8 @@ mod tests {
     use aes_gcm::aead::{AeadInPlace, KeyInit};
     use aes_gcm::{Aes256Gcm, Nonce};
     use base64::prelude::BASE64_STANDARD;
+    #[cfg(not(target_os = "macos"))]
+    use base64::Engine as _;
     use cbc::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
     use cbc::Encryptor;
     use pbkdf2::pbkdf2_hmac;
