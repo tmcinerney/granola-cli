@@ -118,6 +118,9 @@ Unofficial, reverse-engineered, MIT-licensed. Not affiliated with Granola.
 APIs may change without notice; pin to a version that works for you and
 test before upgrading.
 
+Maintainers: see [RELEASING.md](RELEASING.md) for the tag/release/Homebrew
+tap workflow.
+
 ## Credits
 
 - API spec and original CLI:
