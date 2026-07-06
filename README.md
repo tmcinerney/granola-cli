@@ -121,6 +121,15 @@ test before upgrading.
 Maintainers: see [RELEASING.md](RELEASING.md) for the tag/release/Homebrew
 tap workflow.
 
+## Related
+
+**[granola-mcp](https://github.com/tmcinerney/granola-mcp)** — MCP server that wraps this CLI
+and exposes Granola meetings, notes, and transcripts as tools to Claude Code and Claude Desktop.
+Use this if you want Claude to query your Granola data directly via the Model Context Protocol,
+rather than through the CLI plugin skills above.
+
+---
+
 ## Credits
 
 - API spec and original CLI:
