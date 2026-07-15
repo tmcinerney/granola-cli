@@ -84,6 +84,18 @@ struct ListArgs {
     /// Upper bound — same accepted forms as --since
     #[arg(long)]
     until: Option<String>,
+    /// Lower creation-time bound — same accepted forms as --since
+    #[arg(long)]
+    created_since: Option<String>,
+    /// Exclusive upper creation-time bound — same accepted forms as --since
+    #[arg(long)]
+    created_until: Option<String>,
+    /// Lower document-update-time bound — same accepted forms as --since
+    #[arg(long)]
+    updated_since: Option<String>,
+    /// Exclusive upper document-update-time bound — same accepted forms as --since
+    #[arg(long)]
+    updated_until: Option<String>,
     /// Substring match on meeting title (case-insensitive)
     #[arg(short = 's', long)]
     search: Option<String>,
@@ -335,14 +347,28 @@ fn fetch_meetings_merged(client: &api::Client, include_shared: bool) -> Result<V
 }
 
 fn meeting_list(args: &ListArgs) -> Result<()> {
-    let since = args
-        .since
+    let created_since = args
+        .created_since
+        .as_deref()
+        .or(args.since.as_deref())
+        .map(output::parse_date_spec)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let created_until = args
+        .created_until
+        .as_deref()
+        .or(args.until.as_deref())
+        .map(output::parse_date_spec)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let updated_since = args
+        .updated_since
         .as_deref()
         .map(output::parse_date_spec)
         .transpose()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let until = args
-        .until
+    let updated_until = args
+        .updated_until
         .as_deref()
         .map(output::parse_date_spec)
         .transpose()
@@ -355,7 +381,8 @@ fn meeting_list(args: &ListArgs) -> Result<()> {
 
     let filtered: Vec<Value> = meetings
         .into_iter()
-        .filter(|m| in_date_range(m, since, until))
+        .filter(|m| in_date_range(m, created_since, created_until))
+        .filter(|m| in_timestamp_range(m, "updated_at", updated_since, updated_until))
         .filter(|m| match &search {
             Some(q) => m
                 .get("title")
@@ -386,22 +413,30 @@ fn meeting_list(args: &ListArgs) -> Result<()> {
 }
 
 fn in_date_range(m: &Value, since: Option<DateTime<Utc>>, until: Option<DateTime<Utc>>) -> bool {
-    let updated = m
-        .get("updated_at")
-        .or_else(|| m.get("created_at"))
+    in_timestamp_range(m, "created_at", since, until)
+}
+
+fn in_timestamp_range(
+    m: &Value,
+    field: &str,
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+) -> bool {
+    let timestamp = m
+        .get(field)
         .and_then(Value::as_str)
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&Utc));
-    let Some(updated) = updated else {
+    let Some(timestamp) = timestamp else {
         return since.is_none() && until.is_none();
     };
     if let Some(s) = since {
-        if updated < s {
+        if timestamp < s {
             return false;
         }
     }
     if let Some(u) = until {
-        if updated > u {
+        if timestamp >= u {
             return false;
         }
     }
@@ -583,8 +618,40 @@ fn meeting_export(args: &ExportArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_meeting_id_from_documents;
+    use super::{in_date_range, resolve_meeting_id_from_documents};
+    use chrono::{DateTime, Utc};
     use serde_json::json;
+
+    fn timestamp(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn date_range_uses_created_at_not_updated_at() {
+        let meeting = json!({
+            "created_at": "2026-07-15T17:00:00Z",
+            "updated_at": "2026-08-01T17:00:00Z"
+        });
+
+        assert!(in_date_range(
+            &meeting,
+            Some(timestamp("2026-07-15T00:00:00Z")),
+            Some(timestamp("2026-07-16T00:00:00Z")),
+        ));
+    }
+
+    #[test]
+    fn date_range_excludes_its_upper_bound() {
+        let meeting = json!({ "created_at": "2026-07-16T00:00:00Z" });
+
+        assert!(!in_date_range(
+            &meeting,
+            Some(timestamp("2026-07-15T00:00:00Z")),
+            Some(timestamp("2026-07-16T00:00:00Z")),
+        ));
+    }
 
     #[test]
     fn keeps_full_meeting_uuid() {
