@@ -51,6 +51,12 @@ granola auth status       # validates against the Granola API
 granola meeting list      # smoke test — should show recent meetings
 ```
 
+On macOS, Granola desktop 7.427+ moves its encryption key into app-only
+Keychain storage. Upgraded installs can still run `granola auth login` once:
+the CLI exchanges a leftover plaintext refresh token and stores its own rotated
+credential chain in the OS keychain. Fresh installs with no leftover plaintext
+token cannot use this bootstrap path.
+
 ## Usage
 
 ```sh

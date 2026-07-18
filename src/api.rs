@@ -13,7 +13,7 @@ use serde_json::Value;
 use crate::auth;
 
 const BASE_URL: &str = "https://api.granola.ai";
-const APP_VERSION: &str = "7.0.0";
+const APP_VERSION: &str = auth::GRANOLA_CLIENT_VERSION;
 const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RETRIES: u32 = 3;

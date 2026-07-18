@@ -155,8 +155,29 @@ fn run_auth(cmd: &AuthCmd) -> Result<()> {
 }
 
 fn auth_login(opts: &OutputOpts) -> Result<()> {
-    let creds = match auth::load_credentials_from_file() {
-        Ok(c) => c,
+    match auth::load_credentials_from_file() {
+        Ok(c) => auth::save_credentials(&c)?,
+        #[cfg(target_os = "macos")]
+        Err(auth::Error::DesktopKeyMigrated) => match auth::bootstrap_migrated_credentials() {
+            Ok(_) => {}
+            Err(auth::Error::RefreshRejected { .. }) => {
+                return emit_error(
+                    opts,
+                    "bootstrap_refresh_rejected",
+                    "Granola rejected the leftover desktop refresh token. This install can no \
+                     longer bootstrap CLI credentials from local desktop state.",
+                )
+            }
+            Err(auth::Error::NoDesktopCredentials { .. }) => {
+                return emit_error(
+                    opts,
+                    "no_bootstrap_credentials",
+                    "Granola moved its encryption key into app-only storage and no leftover \
+                     plaintext refresh token is available for one-time CLI bootstrap.",
+                )
+            }
+            Err(e) => return Err(e.into()),
+        },
         Err(auth::Error::NoDesktopCredentials { tried }) => {
             let msg = format!(
                 "could not find Granola credentials on disk. Looked in: {}. \
@@ -170,9 +191,7 @@ fn auth_login(opts: &OutputOpts) -> Result<()> {
             return emit_error(opts, "no_desktop_credentials", &msg);
         }
         Err(e) => return Err(e.into()),
-    };
-    auth::save_credentials(&creds)?;
-
+    }
     // Validate by hitting /v1/get-workspaces (the cheapest authenticated call
     // per the upstream API spec). This catches the silent-success bug the
     // upstream CLI has — where login appears to succeed but the imported

@@ -1,13 +1,13 @@
-//! Authentication: credential discovery, keychain storage, WorkOS refresh.
+//! Authentication: credential discovery, keychain storage, and token refresh.
 //!
 //! This module is a direct port of the upstream `src/lib/auth.ts` with the
 //! `stored-accounts.json` fix from beaulebens/granola-cli#6.
 //!
 //! Lifecycle: `auth login` is the only path that reads files from the Granola
-//! desktop app. After import, credentials live in the OS keychain and are
-//! rotated via WorkOS refresh. If Granola desktop encrypts `stored-accounts.json`
-//! in a future release, only new logins break — existing installs keep
-//! working until their refresh token chain dies.
+//! desktop app. After import, credentials live in the OS keychain. Granola
+//! 7.427+ moved its macOS DEK into an app-only Keychain access group, so an
+//! upgraded install bootstraps once from its leftover plaintext refresh token
+//! and then owns a separately persisted rotation chain.
 
 #[cfg(any(target_os = "macos", test))]
 use aes::Aes128;
@@ -38,7 +38,11 @@ use serde::{Deserialize, Serialize};
 const SERVICE_NAME: &str = "com.granola.cli";
 const ACCOUNT_NAME: &str = "credentials";
 const DEFAULT_CLIENT_ID: &str = "client_GranolaMac";
+#[cfg(target_os = "macos")]
+const GRANOLA_REFRESH_URL: &str = "https://api.granola.ai/v1/refresh-access-token";
+#[cfg(not(target_os = "macos"))]
 const WORKOS_AUTH_URL: &str = "https://api.workos.com/user_management/authenticate";
+pub(crate) const GRANOLA_CLIENT_VERSION: &str = "7.427.3";
 #[cfg(target_os = "macos")]
 const GRANOLA_SAFE_STORAGE_SERVICE: &str = "Granola Safe Storage";
 #[cfg(target_os = "macos")]
@@ -77,10 +81,13 @@ pub enum Error {
     Http(#[from] Box<ureq::Error>),
     #[error("no credentials in keychain — run `granola auth login`")]
     NoCredentials,
-    #[error("refresh token rejected by WorkOS (HTTP {status})")]
+    #[error("refresh token rejected by authentication provider (HTTP {status})")]
     RefreshRejected { status: u16 },
     #[error("could not locate Granola desktop credentials — tried {tried:?}")]
     NoDesktopCredentials { tried: Vec<PathBuf> },
+    #[cfg(target_os = "macos")]
+    #[error("Granola moved its desktop encryption key into an app-only Keychain access group")]
+    DesktopKeyMigrated,
     #[cfg(any(target_os = "macos", test))]
     #[error("could not read encrypted Granola desktop credentials: {0}")]
     EncryptedDesktopCredentials(String),
@@ -409,6 +416,10 @@ fn load_encrypted_credentials_from_file(
     let dek_path = storage_dek_path().ok_or(Error::NoHomeDir)?;
     tried.push(dek_path.clone());
 
+    if !dek_path.is_file() {
+        return Err(Error::DesktopKeyMigrated);
+    }
+
     // AIDEV-NOTE: Current Granola macOS builds keep plaintext auth files frozen
     // while rotating live tokens in *.enc files. If encrypted files exist, do
     // not silently fall back to plaintext or we can re-import a dead refresh token.
@@ -485,6 +496,39 @@ pub fn load_credentials_from_file() -> Result<Credentials, Error> {
     Err(Error::NoDesktopCredentials { tried })
 }
 
+/// Load a leftover plaintext refresh token for the one-time post-migration
+/// bootstrap. The access token in these files is intentionally ignored: it is
+/// stale, but Granola's refresh proxy may still accept the refresh token and
+/// return a new independently rotated credential pair.
+#[cfg(target_os = "macos")]
+pub fn load_legacy_refresh_credentials() -> Result<Credentials, Error> {
+    let mut tried = Vec::new();
+
+    if let Some(p) = stored_accounts_path() {
+        tried.push(p.clone());
+        if let Ok(content) = std::fs::read_to_string(&p) {
+            if let Some(creds) = parse_stored_accounts(&content) {
+                if !creds.refresh_token.is_empty() {
+                    return Ok(creds);
+                }
+            }
+        }
+    }
+
+    if let Some(p) = supabase_path() {
+        tried.push(p.clone());
+        if let Ok(content) = std::fs::read_to_string(&p) {
+            if let Some(creds) = parse_supabase(&content) {
+                if !creds.refresh_token.is_empty() {
+                    return Ok(creds);
+                }
+            }
+        }
+    }
+
+    Err(Error::NoDesktopCredentials { tried })
+}
+
 // ---- Refresh (single-use, under file lock) ----------------------------------
 
 fn refresh_lock_path() -> Result<PathBuf, Error> {
@@ -494,22 +538,91 @@ fn refresh_lock_path() -> Result<PathBuf, Error> {
     Ok(dir.join("refresh.lock"))
 }
 
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Deserialize)]
+struct GranolaRefreshResponse {
+    access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+}
+
+#[cfg(not(target_os = "macos"))]
 #[derive(Deserialize)]
 struct WorkOsRefreshResponse {
     access_token: String,
     refresh_token: String,
 }
 
-/// Refresh the access token via WorkOS. Critical: WorkOS refresh tokens are
-/// single-use — each call returns a new one that must be saved immediately,
-/// or the chain is broken.
-///
-/// The read-creds → POST → save-creds sequence runs under an exclusive
-/// `fd-lock` so two concurrent `granola` processes can't both consume the
-/// same refresh token. (This can't protect against the desktop app
-/// independently rotating the file — but the desktop app writes to the
-/// file, not the keychain, so we're isolated post-login.)
-pub fn refresh_access_token() -> Result<Credentials, Error> {
+#[cfg(any(target_os = "macos", test))]
+fn credentials_from_granola_refresh(
+    current: &Credentials,
+    refreshed: GranolaRefreshResponse,
+) -> Credentials {
+    Credentials {
+        refresh_token: refreshed
+            .refresh_token
+            .filter(|token| !token.is_empty())
+            .unwrap_or_else(|| current.refresh_token.clone()),
+        access_token: refreshed.access_token,
+        client_id: current.client_id.clone(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn exchange_refresh_token(creds: &Credentials) -> Result<Credentials, Error> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(15))
+        .build();
+
+    let body = serde_json::json!({
+        "refresh_token": creds.refresh_token,
+    });
+
+    let response = match agent
+        .post(GRANOLA_REFRESH_URL)
+        .set("Accept", "*/*")
+        .set("User-Agent", &format!("Granola/{GRANOLA_CLIENT_VERSION}"))
+        .set("X-Client-Version", GRANOLA_CLIENT_VERSION)
+        .set("X-Granola-Platform", "darwin")
+        .send_json(body)
+    {
+        Ok(r) => r,
+        Err(ureq::Error::Status(status, _resp)) => {
+            return Err(Error::RefreshRejected { status });
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    let parsed: GranolaRefreshResponse = response.into_json()?;
+    Ok(credentials_from_granola_refresh(creds, parsed))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn exchange_refresh_token(creds: &Credentials) -> Result<Credentials, Error> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(15))
+        .build();
+    let body = serde_json::json!({
+        "client_id": creds.client_id,
+        "grant_type": "refresh_token",
+        "refresh_token": creds.refresh_token,
+    });
+    let response = match agent.post(WORKOS_AUTH_URL).send_json(body) {
+        Ok(r) => r,
+        Err(ureq::Error::Status(status, _resp)) => {
+            return Err(Error::RefreshRejected { status });
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let parsed: WorkOsRefreshResponse = response.into_json()?;
+    Ok(Credentials {
+        refresh_token: parsed.refresh_token,
+        access_token: parsed.access_token,
+        client_id: creds.client_id.clone(),
+    })
+}
+
+fn with_refresh_lock<T>(f: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
     let lock_path = refresh_lock_path()?;
     let file: File = OpenOptions::new()
         .read(true)
@@ -519,39 +632,43 @@ pub fn refresh_access_token() -> Result<Credentials, Error> {
         .open(&lock_path)?;
     let mut lock = fd_lock::RwLock::new(file);
     let _guard = lock.write()?;
+    f()
+}
 
-    // Re-read inside the lock — another process may have refreshed already.
-    let creds = get_credentials()?.ok_or(Error::NoCredentials)?;
-    if creds.refresh_token.is_empty() {
-        return Err(Error::NoCredentials);
-    }
+/// Exchange a leftover plaintext refresh token after Granola migrates its DEK
+/// into an app-only Keychain access group, then persist the rotated credential
+/// pair before returning its access token to the caller.
+#[cfg(target_os = "macos")]
+pub fn bootstrap_migrated_credentials() -> Result<Credentials, Error> {
+    with_refresh_lock(|| {
+        let creds = load_legacy_refresh_credentials()?;
+        let new_creds = exchange_refresh_token(&creds)?;
+        save_credentials(&new_creds)?;
+        Ok(new_creds)
+    })
+}
 
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(15))
-        .build();
-
-    let body = serde_json::json!({
-        "client_id": creds.client_id,
-        "grant_type": "refresh_token",
-        "refresh_token": creds.refresh_token,
-    });
-
-    let response = match agent.post(WORKOS_AUTH_URL).send_json(body) {
-        Ok(r) => r,
-        Err(ureq::Error::Status(status, _resp)) => {
-            return Err(Error::RefreshRejected { status });
+/// Refresh the access token via Granola's desktop refresh proxy. The returned
+/// refresh token rotates and must be saved before the caller uses the access
+/// token, or a crash can strand the credential chain.
+///
+/// The read-creds → POST → save-creds sequence runs under an exclusive
+/// `fd-lock` so two concurrent `granola` processes can't both consume the
+/// same refresh token. (This can't protect against the desktop app
+/// independently rotating the file — but the desktop app writes to the
+/// file, not the keychain, so we're isolated post-login.)
+pub fn refresh_access_token() -> Result<Credentials, Error> {
+    with_refresh_lock(|| {
+        // Re-read inside the lock — another process may have refreshed already.
+        let creds = get_credentials()?.ok_or(Error::NoCredentials)?;
+        if creds.refresh_token.is_empty() {
+            return Err(Error::NoCredentials);
         }
-        Err(e) => return Err(e.into()),
-    };
 
-    let parsed: WorkOsRefreshResponse = response.into_json()?;
-    let new_creds = Credentials {
-        refresh_token: parsed.refresh_token,
-        access_token: parsed.access_token,
-        client_id: creds.client_id,
-    };
-    save_credentials(&new_creds)?;
-    Ok(new_creds)
+        let new_creds = exchange_refresh_token(&creds)?;
+        save_credentials(&new_creds)?;
+        Ok(new_creds)
+    })
 }
 
 #[cfg(test)]
@@ -700,6 +817,46 @@ mod tests {
     fn supabase_legacy_missing_refresh_token() {
         let file = serde_json::json!({ "access_token": "AT" });
         assert!(parse_supabase(&file.to_string()).is_none());
+    }
+
+    #[test]
+    fn granola_refresh_rotates_refresh_token() {
+        let current = Credentials {
+            refresh_token: "RT_OLD".into(),
+            access_token: "AT_OLD".into(),
+            client_id: "client".into(),
+        };
+        let refreshed = GranolaRefreshResponse {
+            access_token: "AT_NEW".into(),
+            refresh_token: Some("RT_NEW".into()),
+        };
+
+        assert_eq!(
+            credentials_from_granola_refresh(&current, refreshed),
+            Credentials {
+                refresh_token: "RT_NEW".into(),
+                access_token: "AT_NEW".into(),
+                client_id: "client".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn granola_refresh_preserves_token_when_response_omits_rotation() {
+        let current = Credentials {
+            refresh_token: "RT_OLD".into(),
+            access_token: "AT_OLD".into(),
+            client_id: "client".into(),
+        };
+        let refreshed = GranolaRefreshResponse {
+            access_token: "AT_NEW".into(),
+            refresh_token: None,
+        };
+
+        assert_eq!(
+            credentials_from_granola_refresh(&current, refreshed).refresh_token,
+            "RT_OLD"
+        );
     }
 
     #[test]
