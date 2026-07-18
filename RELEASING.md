@@ -18,15 +18,15 @@ Create a release worktree from the current `main`:
 
 ```sh
 git fetch origin
-git worktree add .worktrees/release-v0.1.3 -b release/v0.1.3 origin/main
-cd .worktrees/release-v0.1.3
+git worktree add .worktrees/release-v0.1.4 -b release/v0.1.4 origin/main
+cd .worktrees/release-v0.1.4
 ```
 
 Bump the package version in `Cargo.toml`, then commit it:
 
 ```sh
 git add Cargo.toml
-git commit -m "chore(release): bump version to 0.1.3"
+git commit -m "chore(release): bump version to 0.1.4"
 ```
 
 `Cargo.lock` does not normally change for a pure version bump. Add it only if
@@ -38,10 +38,10 @@ Fast-forward `main`, tag the release commit, and push both:
 
 ```sh
 git checkout main
-git merge --ff-only release/v0.1.3
-git tag v0.1.3
+git merge --ff-only release/v0.1.4
+git tag v0.1.4
 git push origin main
-git push origin v0.1.3
+git push origin v0.1.4
 ```
 
 The release workflow in `.github/workflows/release.yml` runs when a `v*` tag
@@ -83,16 +83,16 @@ The release assets and checksums live on the GitHub Release page. The formula
 URLs follow this pattern:
 
 ```text
-https://github.com/tmcinerney/granola-cli/releases/download/v0.1.3/granola-v0.1.3-aarch64-apple-darwin.tar.gz
-https://github.com/tmcinerney/granola-cli/releases/download/v0.1.3/granola-v0.1.3-x86_64-apple-darwin.tar.gz
-https://github.com/tmcinerney/granola-cli/releases/download/v0.1.3/granola-v0.1.3-x86_64-unknown-linux-gnu.tar.gz
+https://github.com/tmcinerney/granola-cli/releases/download/v0.1.4/granola-v0.1.4-aarch64-apple-darwin.tar.gz
+https://github.com/tmcinerney/granola-cli/releases/download/v0.1.4/granola-v0.1.4-x86_64-apple-darwin.tar.gz
+https://github.com/tmcinerney/granola-cli/releases/download/v0.1.4/granola-v0.1.4-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 Commit and push the tap update:
 
 ```sh
 git add Formula/granola-cli.rb
-git commit -m "granola-cli 0.1.3"
+git commit -m "granola-cli 0.1.4"
 git push origin main
 ```
 
@@ -120,6 +120,6 @@ done:
 
 ```sh
 cd /Users/tmcinerney/Code/Public/granola-cli
-git worktree remove .worktrees/release-v0.1.3
-git branch -d release/v0.1.3
+git worktree remove .worktrees/release-v0.1.4
+git branch -d release/v0.1.4
 ```
