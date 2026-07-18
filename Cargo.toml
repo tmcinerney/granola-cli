@@ -17,7 +17,7 @@ name = "granola"
 path = "src/main.rs"
 
 [dependencies]
-aes = "0.8"
+aes = "0.9"
 aes-gcm = "0.10"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
