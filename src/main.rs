@@ -1,7 +1,7 @@
 //! granola-cli — Rust port of the upstream JS CLI with the credential-storage
 //! fix from beaulebens/granola-cli#6 baked in.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -61,7 +61,9 @@ enum MeetingCmd {
     /// Print meeting notes as markdown
     Notes(IdArgs),
     /// Print meeting transcript
-    Transcript(IdArgs),
+    Transcript(TranscriptArgs),
+    /// Show document, transcript, and conservative attribution context
+    Context(IdArgs),
     /// Export a meeting (notes + optional transcript) to a file
     Export(ExportArgs),
 }
@@ -110,6 +112,17 @@ struct ListArgs {
 struct IdArgs {
     /// Meeting (document) ID or unique prefix from `meeting list`
     id: String,
+    #[command(flatten)]
+    out: OutputOpts,
+}
+
+#[derive(Args, Clone)]
+struct TranscriptArgs {
+    /// Meeting (document) ID or unique prefix from `meeting list`
+    id: String,
+    /// Show speaker names when Granola supplies them in raw transcript segments
+    #[arg(long)]
+    show_attribution: bool,
     #[command(flatten)]
     out: OutputOpts,
 }
@@ -268,6 +281,7 @@ fn run_meeting(cmd: &MeetingCmd) -> Result<()> {
         MeetingCmd::View(a) => meeting_view(a),
         MeetingCmd::Notes(a) => meeting_notes(a),
         MeetingCmd::Transcript(a) => meeting_transcript(a),
+        MeetingCmd::Context(a) => meeting_context(a),
         MeetingCmd::Export(a) => meeting_export(a),
     }
 }
@@ -557,7 +571,7 @@ fn meeting_notes(args: &IdArgs) -> Result<()> {
     Ok(())
 }
 
-fn meeting_transcript(args: &IdArgs) -> Result<()> {
+fn meeting_transcript(args: &TranscriptArgs) -> Result<()> {
     let transcript = api::with_token_refresh(|c| {
         let id =
             resolve_meeting_id(c, &args.id).map_err(|e| api::Error::Transport(e.to_string()))?;
@@ -574,12 +588,224 @@ fn meeting_transcript(args: &IdArgs) -> Result<()> {
                         .get("start_timestamp")
                         .and_then(Value::as_str)
                         .unwrap_or("");
-                    println!("[{ts}] ({source}) {text}");
+                    if args.show_attribution {
+                        println!("{}", format_transcript_segment(seg));
+                    } else {
+                        println!("[{ts}] ({source}) {text}");
+                    }
                 }
             }
         }
     }
     Ok(())
+}
+
+/// Render optional speaker identity without replacing Granola's raw
+/// audio-channel label. This is intentionally opt-in because the raw channel
+/// remains the clearest default when no diarization is present.
+fn format_transcript_segment(seg: &Value) -> String {
+    let source = seg.get("source").and_then(Value::as_str).unwrap_or("");
+    let text = seg.get("text").and_then(Value::as_str).unwrap_or("");
+    let ts = seg
+        .get("start_timestamp")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    match detected_speaker_name(seg) {
+        Some(speaker) => format!("[{ts}] ({source}; speaker: {speaker}) {text}"),
+        None => format!("[{ts}] ({source}) {text}"),
+    }
+}
+
+/// Return only speaker identity supplied by Granola's transcript payload.
+/// In particular, this must not infer a remote name from calendar attendees:
+/// a `system` audio channel can contain multiple remote participants.
+fn detected_speaker_name(seg: &Value) -> Option<&str> {
+    seg.pointer("/detectedSpeaker/participantName")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            seg.get("detected_speaker_name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+        })
+}
+
+fn attribution_summary(transcript: &Value) -> Value {
+    let mut channels: BTreeMap<String, (u64, BTreeSet<String>)> = BTreeMap::new();
+    for segment in transcript.as_array().into_iter().flatten() {
+        let source = segment
+            .get("source")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        let entry = channels.entry(source).or_default();
+        entry.0 += 1;
+        if let Some(name) = detected_speaker_name(segment) {
+            entry.1.insert(name.to_string());
+        }
+    }
+
+    let channels: Vec<Value> = channels
+        .into_iter()
+        .map(|(source, (segment_count, detected_speaker_names))| {
+            serde_json::json!({
+                "source": source,
+                "segment_count": segment_count,
+                "detected_speaker_names": detected_speaker_names.into_iter().collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "channels": channels,
+        "speaker_attribution": "Only names present in raw transcript segments are listed; no calendar-based inference is applied.",
+    })
+}
+
+/// A compact, stable and conservative attribution summary. Complete raw data
+/// remains available through `meeting view --output json` and `meeting
+/// transcript --output json`; context deliberately omits emails, URLs, note
+/// content, and arbitrary API fields.
+fn person_display_name(person: &Value) -> Option<&str> {
+    person
+        .get("name")
+        .and_then(Value::as_str)
+        .or_else(|| person.pointer("/name/fullName").and_then(Value::as_str))
+        .or_else(|| {
+            person
+                .pointer("/details/person/name/fullName")
+                .and_then(Value::as_str)
+        })
+        .filter(|name| !name.is_empty())
+}
+
+fn meeting_context_value(document: Value, transcript: Value) -> Result<Value> {
+    let segments = transcript.as_array().ok_or_else(|| {
+        anyhow::anyhow!("Granola returned a transcript payload that is not a segment array")
+    })?;
+    let prosemirror = document
+        .pointer("/last_viewed_panel/content")
+        .or_else(|| document.get("notes"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let attribution = attribution_summary(&transcript);
+    let attendees = document
+        .pointer("/people/attendees")
+        .and_then(Value::as_array)
+        .map(|attendees| {
+            attendees
+                .iter()
+                .filter_map(person_display_name)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "provenance": {
+            "document": "Granola meeting document API response",
+            "notes": "Editable note document stored with the meeting; it has no transcript-segment or speaker provenance.",
+            "transcript": "Granola raw transcript API response",
+            "speaker_attribution": "Only names supplied in raw transcript segments are summarized; calendar participants are never inferred as speakers."
+        },
+        "document": {
+            "id": document.get("id"),
+            "title": document.get("title"),
+            "type": document.get("type"),
+            "created_at": document.get("created_at"),
+            "updated_at": document.get("updated_at"),
+            "creation_source": document.get("creation_source"),
+        },
+        "people": {
+            "creator_name": document.pointer("/people/creator").and_then(person_display_name),
+            "attendee_names": attendees,
+        },
+        "conferencing": {
+            "type": document.pointer("/people/conferencing/type"),
+        },
+        "calendar": {
+            "start": {
+                "date_time": document.pointer("/google_calendar_event/start/dateTime"),
+                "date": document.pointer("/google_calendar_event/start/date"),
+                "time_zone": document.pointer("/google_calendar_event/start/timeZone"),
+            },
+            "end": {
+                "date_time": document.pointer("/google_calendar_event/end/dateTime"),
+                "date": document.pointer("/google_calendar_event/end/date"),
+                "time_zone": document.pointer("/google_calendar_event/end/timeZone"),
+            },
+        },
+        "notes": {
+            "available": !prosemirror.is_null(),
+            "format": if prosemirror.is_null() { Value::Null } else { Value::String("prosemirror".into()) },
+        },
+        "transcript": {
+            "segment_count": segments.len(),
+        },
+        "attribution": attribution,
+    }))
+}
+
+fn meeting_context(args: &IdArgs) -> Result<()> {
+    let resolved_id = api::with_token_refresh(|c| {
+        resolve_meeting_id(c, &args.id).map_err(|e| api::Error::Transport(e.to_string()))
+    })?;
+    let doc = api::with_token_refresh(|c| fetch_full_document(c, &resolved_id))?;
+    let transcript = api::with_token_refresh(|c| c.get_document_transcript(&resolved_id))?;
+    let context = meeting_context_value(doc, transcript)?;
+
+    match args.out.output {
+        Format::Json | Format::Yaml => output::emit(&context, args.out.output),
+        _ => print_context_summary(&context),
+    }
+    Ok(())
+}
+
+fn print_context_summary(context: &Value) {
+    let title = context
+        .pointer("/document/title")
+        .and_then(Value::as_str)
+        .unwrap_or("(untitled)");
+    let id = context
+        .pointer("/document/id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    println!("Meeting: {title}");
+    if !id.is_empty() {
+        println!("Document ID: {id}");
+    }
+    println!("Transcript channels:");
+    if let Some(channels) = context
+        .pointer("/attribution/channels")
+        .and_then(Value::as_array)
+    {
+        for channel in channels {
+            let source = channel
+                .get("source")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let count = channel
+                .get("segment_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let names = channel
+                .get("detected_speaker_names")
+                .and_then(Value::as_array)
+                .map(|names| {
+                    names
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            if names.is_empty() {
+                println!("- {source}: {count} segments");
+            } else {
+                println!("- {source}: {count} segments; detected speakers: {names}");
+            }
+        }
+    }
+    println!("Raw data: `granola meeting view <id> --output json` and `granola meeting transcript <id> --output json`.");
 }
 
 fn meeting_export(args: &ExportArgs) -> Result<()> {
@@ -637,7 +863,10 @@ fn meeting_export(args: &ExportArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{in_date_range, resolve_meeting_id_from_documents};
+    use super::{
+        attribution_summary, format_transcript_segment, in_date_range, meeting_context_value,
+        resolve_meeting_id_from_documents,
+    };
     use chrono::{DateTime, Utc};
     use serde_json::json;
 
@@ -715,5 +944,157 @@ mod tests {
             err.to_string().contains("did not match any recent meeting"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn attribution_summary_uses_nested_detected_speaker() {
+        let segment = json!({
+            "source": "system",
+            "start_timestamp": "2026-07-22T16:31:21.054Z",
+            "text": "Thanks for that.",
+            "detectedSpeaker": { "participantName": "Gary Grossman" }
+        });
+
+        assert_eq!(
+            attribution_summary(&json!([segment])),
+            json!({
+                "channels": [{
+                    "source": "system",
+                    "segment_count": 1,
+                    "detected_speaker_names": ["Gary Grossman"]
+                }],
+                "speaker_attribution": "Only names present in raw transcript segments are listed; no calendar-based inference is applied."
+            })
+        );
+    }
+
+    #[test]
+    fn attribution_summary_falls_back_to_legacy_speaker_field() {
+        let segment = json!({
+            "source": "microphone",
+            "start_timestamp": "2026-07-22T16:31:21.054Z",
+            "text": "Hello.",
+            "detected_speaker_name": "Travers"
+        });
+
+        assert_eq!(
+            attribution_summary(&json!([segment])),
+            json!({
+                "channels": [{
+                    "source": "microphone",
+                    "segment_count": 1,
+                    "detected_speaker_names": ["Travers"]
+                }],
+                "speaker_attribution": "Only names present in raw transcript segments are listed; no calendar-based inference is applied."
+            })
+        );
+    }
+
+    #[test]
+    fn transcript_attribution_output_keeps_raw_source() {
+        let segment = json!({
+            "source": "system",
+            "start_timestamp": "2026-07-22T16:31:21.054Z",
+            "text": "Hello.",
+            "detectedSpeaker": { "participantName": "Gary Grossman" }
+        });
+
+        assert_eq!(
+            format_transcript_segment(&segment),
+            "[2026-07-22T16:31:21.054Z] (system; speaker: Gary Grossman) Hello."
+        );
+    }
+
+    #[test]
+    fn attribution_summary_does_not_infer_names_for_unnamed_channels() {
+        let transcript = json!([
+            { "source": "microphone", "text": "Hey Gary." },
+            { "source": "system", "text": "Hi." },
+            {
+                "source": "system",
+                "text": "Thanks.",
+                "detectedSpeaker": { "participantName": "Gary Grossman" }
+            }
+        ]);
+
+        assert_eq!(
+            attribution_summary(&transcript),
+            json!({
+                "channels": [
+                    {
+                        "source": "microphone",
+                        "segment_count": 1,
+                        "detected_speaker_names": []
+                    },
+                    {
+                        "source": "system",
+                        "segment_count": 2,
+                        "detected_speaker_names": ["Gary Grossman"]
+                    }
+                ],
+                "speaker_attribution": "Only names present in raw transcript segments are listed; no calendar-based inference is applied."
+            })
+        );
+    }
+
+    #[test]
+    fn context_is_compact_and_omits_raw_sensitive_fields() {
+        let document = json!({
+            "id": "meeting-123",
+            "title": "Gary / Travers",
+            "last_viewed_panel": {
+                "content": {
+                    "type": "doc",
+                    "content": [{ "type": "paragraph", "content": [{ "type": "text", "text": "Decision" }] }]
+                }
+            },
+            "unrecognized_document_field": { "kept": true },
+            "people": {
+                "creator": { "email": "person@example.com", "name": "Travers McInerney" },
+                "attendees": [{ "details": { "person": { "name": { "fullName": "Gary" } } } }]
+            },
+            "google_calendar_event": {
+                "start": { "dateTime": "2026-07-22T17:00:00Z", "timeZone": "America/Los_Angeles" },
+                "end": { "dateTime": "2026-07-22T17:30:00Z", "timeZone": "America/Los_Angeles" }
+            },
+            "url": "https://calendar.example.com/private"
+        });
+        let transcript = json!([
+            {
+                "id": "segment-123",
+                "source": "system",
+                "text": "Hello.",
+                "unrecognized_segment_field": { "kept": true }
+            }
+        ]);
+
+        let context = meeting_context_value(document.clone(), transcript.clone()).unwrap();
+        assert_eq!(context.pointer("/document/id"), Some(&json!("meeting-123")));
+        assert_eq!(context.pointer("/notes/available"), Some(&json!(true)));
+        assert_eq!(
+            context.pointer("/transcript/segment_count"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            context.pointer("/people/creator_name"),
+            Some(&json!("Travers McInerney"))
+        );
+        assert_eq!(
+            context.pointer("/people/attendee_names"),
+            Some(&json!(["Gary"]))
+        );
+        assert!(context.pointer("/document/people").is_none());
+        assert!(context.pointer("/document/url").is_none());
+        assert!(context
+            .pointer("/document/unrecognized_document_field")
+            .is_none());
+        assert!(context.pointer("/transcript/0").is_none());
+    }
+
+    #[test]
+    fn context_rejects_non_array_transcript_payloads() {
+        let err = meeting_context_value(json!({ "id": "meeting-123" }), json!({ "segments": [] }))
+            .expect_err("context needs a raw segment array");
+        assert!(err.to_string().contains("not a segment array"));
     }
 }

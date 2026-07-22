@@ -67,11 +67,39 @@ granola meeting list --search "design review"      # title search
 granola meeting view <id>                          # metadata
 granola meeting notes <id>                         # notes as markdown
 granola meeting transcript <id>                    # full transcript
+granola meeting transcript <id> --show-attribution # include Granola-supplied speaker names
+granola meeting context <id> --output json         # compact attribution/context summary
 granola meeting export <id> --output-file out.md   # combined export
 ```
 
 By default, `meeting list` merges your own meetings with meetings shared to
 you (a gap in the upstream CLI). Pass `--no-shared` to skip that hop.
+
+### Transcript attribution and context
+
+`granola meeting transcript` keeps Granola's raw audio-channel labels, such
+as `microphone` and `system`. They describe capture channels, not necessarily
+individual people: a `system` channel can contain several remote speakers.
+
+Use `granola meeting context <id> --output json` for a compact, stable
+summary of the document, note availability, transcript channels, and any
+speaker names Granola supplied directly in transcript segments. It never
+assigns calendar attendees or a document creator as speakers. The summary
+also omits emails, meeting URLs, editable note content, and raw transcript
+text.
+
+For complete, lossless API responses, use the existing raw commands:
+
+```sh
+granola meeting view <id> --output json        # complete meeting document, including editable notes
+granola meeting transcript <id> --output json  # complete raw transcript segment array
+```
+
+Granola may expose a nested `detectedSpeaker.participantName` field or a
+legacy `detected_speaker_name` field on some transcript segments. The CLI
+lists either only when Granola actually provides it; unnamed channels remain
+unnamed. Add `--show-attribution` to the human-readable transcript output to
+show those optional names without replacing the raw channel label.
 
 ---
 
