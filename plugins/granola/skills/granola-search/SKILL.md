@@ -1,4 +1,5 @@
 ---
+name: granola-search
 description: Search the user's Granola meetings by title. Use when the user asks "find meetings about <topic>", "search for <keyword>", "do I have any meetings on <subject>", or otherwise asks to locate meetings by content keywords.
 ---
 

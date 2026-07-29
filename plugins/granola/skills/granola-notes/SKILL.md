@@ -1,4 +1,5 @@
 ---
+name: granola-notes
 description: Fetch the markdown notes from a specific Granola meeting. Use when the user asks "show me the notes from <meeting>", "what did we discuss in <meeting>", "pull up the standup from yesterday", or otherwise asks for a meeting's content by title, date, or attendees.
 ---
 

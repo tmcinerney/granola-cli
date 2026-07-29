@@ -1,4 +1,5 @@
 ---
+name: granola-recent
 description: List the user's recent Granola meetings (today, yesterday, last N days). Use when the user asks "what meetings did I have", "show recent meetings", "today's meetings", "meetings this week", or similar lookups by recency.
 ---
 

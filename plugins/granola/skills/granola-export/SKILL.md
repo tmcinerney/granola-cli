@@ -1,4 +1,5 @@
 ---
+name: granola-export
 description: Export a Granola meeting (notes, optionally transcript) to a local markdown file. Use when the user says "save this meeting to <path>", "export my standup notes", "write the design review to a file", or otherwise asks to persist meeting content to disk.
 ---
 
