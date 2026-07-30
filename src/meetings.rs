@@ -16,10 +16,7 @@ use crate::api;
 
 /// Owned + shared documents, deduped, filtered by date range and search,
 /// sorted by `updated_at` desc.
-pub(crate) fn fetch_meetings_merged(
-    client: &api::Client,
-    include_shared: bool,
-) -> Result<Vec<Value>> {
+fn fetch_meetings_merged(client: &api::Client, include_shared: bool) -> Result<Vec<Value>> {
     // Owned documents: page through /v2/get-documents until we run out.
     let mut by_id: HashMap<String, Value> = HashMap::new();
     let page_size: u32 = 100;
@@ -110,15 +107,11 @@ pub(crate) fn fetch_meetings_merged(
     Ok(all)
 }
 
-pub(crate) fn in_date_range(
-    m: &Value,
-    since: Option<DateTime<Utc>>,
-    until: Option<DateTime<Utc>>,
-) -> bool {
+fn in_date_range(m: &Value, since: Option<DateTime<Utc>>, until: Option<DateTime<Utc>>) -> bool {
     in_timestamp_range(m, "created_at", since, until)
 }
 
-pub(crate) fn in_timestamp_range(
+fn in_timestamp_range(
     m: &Value,
     field: &str,
     since: Option<DateTime<Utc>>,
@@ -204,16 +197,6 @@ pub(crate) fn fetch_full_document(client: &api::Client, id: &str) -> Result<Valu
     Ok(docs.into_iter().next().unwrap_or(Value::Null))
 }
 
-/// Extract the ProseMirror notes document, falling back to the top-level
-/// `notes` field when no panel has been viewed.
-pub(crate) fn notes_document(document: &Value) -> Value {
-    document
-        .pointer("/last_viewed_panel/content")
-        .or_else(|| document.get("notes"))
-        .cloned()
-        .unwrap_or(Value::Null)
-}
-
 /// Compact per-meeting summary for list responses.
 ///
 /// AIDEV-NOTE: a raw Granola document carries ~47 fields. The largest is
@@ -241,22 +224,10 @@ pub(crate) fn meeting_summary(m: &Value) -> Value {
         "platform": m.pointer("/people/conferencing/type"),
         "attendee_names": attendees,
         "origin": m.get("_origin"),
+        // Cheap here: the list payload carries the flat note fields, so this
+        // answers "which meetings did I take notes in" without a second fetch.
+        "has_own_notes": has_own_notes(m),
     })
-}
-
-/// Notes rendered as markdown, falling back to Granola's flat `notes_markdown`
-/// field when the ProseMirror document is absent or renders empty.
-pub(crate) fn notes_markdown(document: &Value) -> String {
-    let rendered = crate::prosemirror::to_markdown(&notes_document(document));
-    if rendered.is_empty() {
-        document
-            .get("notes_markdown")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string()
-    } else {
-        rendered
-    }
 }
 
 /// Render optional speaker identity without replacing Granola's raw
@@ -314,9 +285,22 @@ pub(crate) fn attribution_summary(transcript: &Value) -> Value {
             })
         })
         .collect();
+    // AIDEV-NOTE: bots are flagged, never removed from detected_speaker_names —
+    // the detection is a heuristic and a false positive must not erase a real
+    // participant. Callers subtract this set if they want humans only.
+    let likely_bots: Vec<Value> = channels
+        .iter()
+        .filter_map(|c| c.get("detected_speaker_names").and_then(Value::as_array))
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|n| looks_like_notetaker_bot(n))
+        .map(|n| Value::String(n.to_string()))
+        .collect();
+
     serde_json::json!({
         "channels": channels,
-        "speaker_attribution": "Only names present in raw transcript segments are listed; no calendar-based inference is applied.",
+        "likely_notetaker_bots": likely_bots,
+        "speaker_attribution": "Only names present in raw transcript segments are listed; no calendar-based inference is applied. Names matching known notetaker vendors are additionally listed in likely_notetaker_bots.",
     })
 }
 
@@ -341,7 +325,7 @@ pub(crate) fn meeting_context_value(document: Value, transcript: Value) -> Resul
     let segments = transcript.as_array().ok_or_else(|| {
         anyhow::anyhow!("Granola returned a transcript payload that is not a segment array")
     })?;
-    let prosemirror = notes_document(&document);
+    let notes = meeting_notes(&document);
     let attribution = attribution_summary(&transcript);
     let attendees = document
         .pointer("/people/attendees")
@@ -390,8 +374,9 @@ pub(crate) fn meeting_context_value(document: Value, transcript: Value) -> Resul
             },
         },
         "notes": {
-            "available": !prosemirror.is_null(),
-            "format": if prosemirror.is_null() { Value::Null } else { Value::String("prosemirror".into()) },
+            "available": !notes.is_empty(),
+            "my_notes": notes.mine.is_some(),
+            "ai_notes": notes.ai.is_some(),
         },
         "transcript": {
             "segment_count": segments.len(),
@@ -400,11 +385,322 @@ pub(crate) fn meeting_context_value(document: Value, transcript: Value) -> Resul
     }))
 }
 
+// ---- Shared query core ------------------------------------------------------
+//
+// AIDEV-NOTE: the CLI and the MCP server must behave identically for the same
+// query, so the *operation* lives here and each front end is only an adapter
+// that translates its own input syntax and formats the output. Before this,
+// main.rs and mcp.rs each parsed bounds, applied filters and chose defaults
+// separately, and they had already drifted seven ways (--no-shared vs
+// owned_only, MCP-only date/offset, different default limits). If you add a
+// parameter, add it to MEETING_LIST_PARAMETERS and to both front ends — the
+// drift test in main.rs fails otherwise.
+
+/// Canonical parameter set for a meeting-list query.
+///
+/// Both front ends are asserted against this: clap argument ids on one side,
+/// the generated JSON schema properties on the other. Output formatting is
+/// deliberately excluded — the CLI offers yaml/table/text that make no sense
+/// over MCP, and MCP's `response_format` is not a filter.
+// Referenced by the drift test rather than at runtime, and load-bearing as
+// documentation of the contract between the two front ends.
+#[allow(dead_code)]
+pub(crate) const MEETING_LIST_PARAMETERS: &[&str] = &[
+    "created_since",
+    "created_until",
+    "date",
+    "include_shared",
+    "limit",
+    "offset",
+    "search",
+    "since",
+    "until",
+    "updated_since",
+    "updated_until",
+];
+
+/// Raw, unparsed query as each front end receives it.
+///
+/// Kept separate from `MeetingQuery` so that date-spec parsing, the `date`
+/// single-day shorthand and limit clamping happen in exactly one place.
+#[derive(Debug, Default)]
+pub(crate) struct MeetingQuerySpec<'a> {
+    pub date: Option<&'a str>,
+    pub since: Option<&'a str>,
+    pub until: Option<&'a str>,
+    pub created_since: Option<&'a str>,
+    pub created_until: Option<&'a str>,
+    pub updated_since: Option<&'a str>,
+    pub updated_until: Option<&'a str>,
+    pub search: Option<&'a str>,
+    pub limit: u32,
+    pub offset: u32,
+    pub include_shared: bool,
+}
+
+/// A resolved query: bounds parsed, search lowercased, limit clamped.
+#[derive(Debug)]
+pub(crate) struct MeetingQuery {
+    pub created_since: Option<DateTime<Utc>>,
+    pub created_until: Option<DateTime<Utc>>,
+    pub updated_since: Option<DateTime<Utc>>,
+    pub updated_until: Option<DateTime<Utc>>,
+    pub search: Option<String>,
+    pub limit: u32,
+    pub offset: u32,
+    pub include_shared: bool,
+}
+
+/// Largest page either front end will return.
+pub(crate) const MAX_LIMIT: u32 = 200;
+
+fn parse_bound(spec: Option<&str>, field: &str) -> Result<Option<DateTime<Utc>>> {
+    match spec {
+        None => Ok(None),
+        Some(s) => crate::output::parse_date_spec(s)
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("invalid `{field}`: {e}")),
+    }
+}
+
+impl MeetingQuerySpec<'_> {
+    pub(crate) fn resolve(self) -> Result<MeetingQuery> {
+        // `date` is shorthand for a single day. Explicit bounds win over it so
+        // that passing both is not silently contradictory.
+        let (date_since, date_until) = match self.date {
+            Some(day) => {
+                let start = parse_bound(Some(day), "date")?.unwrap();
+                (Some(start), Some(start + chrono::Duration::days(1)))
+            }
+            None => (None, None),
+        };
+
+        Ok(MeetingQuery {
+            created_since: parse_bound(self.created_since.or(self.since), "since")?.or(date_since),
+            created_until: parse_bound(self.created_until.or(self.until), "until")?.or(date_until),
+            updated_since: parse_bound(self.updated_since, "updated_since")?,
+            updated_until: parse_bound(self.updated_until, "updated_until")?,
+            search: self.search.map(str::to_lowercase),
+            limit: self.limit.clamp(1, MAX_LIMIT),
+            offset: self.offset,
+            include_shared: self.include_shared,
+        })
+    }
+}
+
+/// One page of matching meetings, with the total so a caller can page.
+pub(crate) struct MeetingPage {
+    pub total_matched: usize,
+    pub offset: u32,
+    /// Full documents for this page, newest first.
+    pub meetings: Vec<Value>,
+}
+
+/// Run a meeting-list query. The single implementation behind both front ends.
+pub(crate) fn list_meetings(client: &api::Client, query: &MeetingQuery) -> Result<MeetingPage> {
+    let all = fetch_meetings_merged(client, query.include_shared)?;
+
+    // AIDEV-NOTE: matched is materialised before paging so the total can be
+    // reported. Without it a caller cannot tell "that is everything" from
+    // "there is more", which is the only thing that makes `offset` usable.
+    let matched: Vec<Value> = all
+        .into_iter()
+        .filter(|m| in_date_range(m, query.created_since, query.created_until))
+        .filter(|m| in_timestamp_range(m, "updated_at", query.updated_since, query.updated_until))
+        .filter(|m| match &query.search {
+            Some(q) => m
+                .get("title")
+                .and_then(Value::as_str)
+                .map(|t| t.to_lowercase().contains(q))
+                .unwrap_or(false),
+            None => true,
+        })
+        .collect();
+
+    let total_matched = matched.len();
+    let meetings = matched
+        .into_iter()
+        .skip(query.offset as usize)
+        .take(query.limit as usize)
+        .collect();
+
+    Ok(MeetingPage {
+        total_matched,
+        offset: query.offset,
+        meetings,
+    })
+}
+
+// ---- Notes ------------------------------------------------------------------
+
+/// The two independent kinds of notes Granola stores for a meeting.
+///
+/// AIDEV-NOTE: these are genuinely different documents, not fallbacks for one
+/// another. `mine` is what you typed during the call (`notes` /
+/// `notes_markdown` / `notes_plain`); `ai` is Granola's generated summary
+/// (`last_viewed_panel.content`). Roughly a quarter of meetings have both.
+/// Earlier code preferred the panel and fell back to yours, which silently
+/// discarded your own notes whenever a summary existed — never collapse these
+/// back into a single field.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct MeetingNotes {
+    pub ai: Option<String>,
+    pub mine: Option<String>,
+}
+
+fn non_empty(s: String) -> Option<String> {
+    let trimmed = s.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Extract both note kinds, each as markdown.
+pub(crate) fn meeting_notes(document: &Value) -> MeetingNotes {
+    let ai = document
+        .pointer("/last_viewed_panel/content")
+        .map(crate::prosemirror::to_markdown)
+        .and_then(non_empty);
+
+    // Yours: the ProseMirror doc if present, else the flat fields Granola also
+    // ships (which are the only form the list endpoint returns).
+    let mine = document
+        .get("notes")
+        .map(crate::prosemirror::to_markdown)
+        .and_then(non_empty)
+        .or_else(|| {
+            document
+                .get("notes_markdown")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .and_then(non_empty)
+        })
+        .or_else(|| {
+            document
+                .get("notes_plain")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .and_then(non_empty)
+        });
+
+    MeetingNotes { ai, mine }
+}
+
+impl MeetingNotes {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.ai.is_none() && self.mine.is_none()
+    }
+
+    /// Structured form, shared by `meeting notes --output json` and the MCP
+    /// tool so both surfaces return the same shape. Absent kinds are null
+    /// rather than empty strings, so "no notes" is distinguishable from "".
+    pub(crate) fn to_json(&self) -> Value {
+        serde_json::json!({
+            "my_notes": self.mine,
+            "ai_notes": self.ai,
+        })
+    }
+
+    /// Render both kinds under headings, so provenance is never ambiguous.
+    /// Yours come first: they are what you chose to write down.
+    pub(crate) fn render_markdown(&self, title: Option<&str>) -> String {
+        let mut out = String::new();
+        if let Some(t) = title {
+            out.push_str(&format!("# {t}\n"));
+        }
+        // Demote by 2 so a content `#` lands at `###`, below the `##` labels.
+        if let Some(mine) = &self.mine {
+            out.push_str(&format!("\n## My notes\n\n{}\n", demote_headings(mine, 2)));
+        }
+        if let Some(ai) = &self.ai {
+            out.push_str(&format!(
+                "\n## AI-enhanced notes\n\n{}\n",
+                demote_headings(ai, 2)
+            ));
+        }
+        if self.is_empty() {
+            out.push_str("\nThis meeting has no notes.\n");
+        }
+        out
+    }
+}
+
+/// Push ATX headings down `by` levels, so embedded content nests *under* the
+/// section heading that introduces it.
+///
+/// AIDEV-NOTE: Granola's AI panel contains its own `# ` headings. Emitted
+/// verbatim under a `## AI-enhanced notes` label they outrank that label, so the
+/// panel's sections read as top-level sections of the meeting. Fenced code
+/// blocks are skipped because a `#` at the start of a line inside one is a
+/// comment, not a heading. Caps at H6, the deepest markdown level.
+fn demote_headings(markdown: &str, by: usize) -> String {
+    let mut out = Vec::new();
+    let mut in_fence = false;
+    for line in markdown.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            out.push(line.to_string());
+            continue;
+        }
+        if !in_fence && trimmed.starts_with('#') {
+            let hashes = trimmed.chars().take_while(|c| *c == '#').count();
+            // Only a real ATX heading: hashes must be followed by a space.
+            if hashes <= 6 && trimmed.chars().nth(hashes) == Some(' ') {
+                let extra = "#".repeat((hashes + by).min(6) - hashes);
+                out.push(format!("{extra}{line}"));
+                continue;
+            }
+        }
+        out.push(line.to_string());
+    }
+    out.join("\n")
+}
+
+/// Whether the caller wrote their own notes for this meeting.
+///
+/// Derived from the list payload's flat fields as well as the ProseMirror doc,
+/// so it works on a list response without a second fetch.
+pub(crate) fn has_own_notes(document: &Value) -> bool {
+    meeting_notes(document).mine.is_some()
+}
+
+// ---- Notetaker bots ---------------------------------------------------------
+
+/// Vendor and role markers that identify an automated meeting-notetaker rather
+/// than a person. Matched case-insensitively as substrings.
+const NOTETAKER_MARKERS: &[&str] = &[
+    "notetaker",
+    "note taker",
+    "notetaking",
+    "fireflies",
+    "otter.ai",
+    "read.ai",
+    "avoma",
+    "fathom notetaker",
+    "grain.co",
+    "chorus.ai",
+    "gong.io",
+    "meeting recorder",
+    "transcription bot",
+];
+
+/// Heuristic: does this detected-speaker name look like a notetaker bot?
+///
+/// AIDEV-NOTE: deliberately a flag rather than a filter, and deliberately
+/// conservative — a false positive would erase a real participant. Callers
+/// receive the full speaker list plus this annotation and decide for
+/// themselves. Calibrated against real transcripts where names like
+/// `Panzerino`, `benton` and `Irad "E-rod" Eyal` must not match.
+pub(crate) fn looks_like_notetaker_bot(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    NOTETAKER_MARKERS.iter().any(|m| lower.contains(m))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        attribution_summary, format_transcript_segment, in_date_range, meeting_context_value,
-        meeting_summary, resolve_meeting_id_from_documents,
+        attribution_summary, format_transcript_segment, has_own_notes, in_date_range,
+        looks_like_notetaker_bot, meeting_context_value, meeting_notes, meeting_summary,
+        resolve_meeting_id_from_documents,
     };
     use chrono::{DateTime, Utc};
     use serde_json::json;
@@ -502,7 +798,8 @@ mod tests {
                     "segment_count": 1,
                     "detected_speaker_names": ["Rae Nakamura"]
                 }],
-                "speaker_attribution": "Only names present in raw transcript segments are listed; no calendar-based inference is applied."
+                "likely_notetaker_bots": [],
+                "speaker_attribution": "Only names present in raw transcript segments are listed; no calendar-based inference is applied. Names matching known notetaker vendors are additionally listed in likely_notetaker_bots."
             })
         );
     }
@@ -524,7 +821,8 @@ mod tests {
                     "segment_count": 1,
                     "detected_speaker_names": ["Sam"]
                 }],
-                "speaker_attribution": "Only names present in raw transcript segments are listed; no calendar-based inference is applied."
+                "likely_notetaker_bots": [],
+                "speaker_attribution": "Only names present in raw transcript segments are listed; no calendar-based inference is applied. Names matching known notetaker vendors are additionally listed in likely_notetaker_bots."
             })
         );
     }
@@ -571,7 +869,8 @@ mod tests {
                         "detected_speaker_names": ["Rae Nakamura"]
                     }
                 ],
-                "speaker_attribution": "Only names present in raw transcript segments are listed; no calendar-based inference is applied."
+                "likely_notetaker_bots": [],
+                "speaker_attribution": "Only names present in raw transcript segments are listed; no calendar-based inference is applied. Names matching known notetaker vendors are additionally listed in likely_notetaker_bots."
             })
         );
     }
@@ -687,6 +986,121 @@ mod tests {
         assert_eq!(summary["attendee_names"], json!([]));
         assert!(summary["platform"].is_null());
         assert!(summary["start"].is_null());
+    }
+
+    /// Regression: an AI panel must not hide notes the user typed themselves.
+    ///
+    /// The old notes_markdown() preferred last_viewed_panel and fell back to
+    /// `notes`, so on the ~25% of meetings with both, your own notes were
+    /// silently dropped.
+    #[test]
+    fn notes_returns_both_kinds_when_both_exist() {
+        let doc = json!({
+            "last_viewed_panel": { "content": {
+                "type": "doc",
+                "content": [{ "type": "paragraph",
+                              "content": [{ "type": "text", "text": "AI summary" }] }]
+            }},
+            "notes": { "type": "doc",
+                "content": [{ "type": "paragraph",
+                              "content": [{ "type": "text", "text": "Note to self" }] }] }
+        });
+        let notes = meeting_notes(&doc);
+        assert_eq!(notes.ai.as_deref(), Some("AI summary"));
+        assert_eq!(notes.mine.as_deref(), Some("Note to self"));
+
+        // Both labelled, with the user's own first.
+        let md = notes.render_markdown(Some("Title"));
+        assert!(md.contains("# Title"));
+        assert!(md.contains("## My notes"));
+        assert!(md.contains("## AI-enhanced notes"));
+        assert!(
+            md.find("## My notes") < md.find("## AI-enhanced notes"),
+            "your own notes should come first:\n{md}"
+        );
+    }
+
+    #[test]
+    fn notes_fall_back_through_the_flat_fields() {
+        // The list endpoint ships notes_markdown / notes_plain but no panel.
+        let only_flat = meeting_notes(&json!({ "notes_markdown": "- typed this" }));
+        assert_eq!(only_flat.mine.as_deref(), Some("- typed this"));
+        assert!(only_flat.ai.is_none());
+        assert!(has_own_notes(&json!({ "notes_plain": "typed" })));
+
+        // Empty or whitespace-only must not count as notes.
+        assert!(!has_own_notes(&json!({ "notes_markdown": "   " })));
+        assert!(meeting_notes(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn embedded_headings_nest_under_their_section_label() {
+        let doc = json!({
+            "notes_markdown": "# Note to Self\n- do the thing",
+            "last_viewed_panel": { "content": { "type": "doc", "content": [] } }
+        });
+        let md = meeting_notes(&doc).render_markdown(Some("Standup"));
+        assert!(md.contains("# Standup"));
+        assert!(md.contains("## My notes"));
+        // The note's own H1 is demoted below the section label, not above it.
+        assert!(md.contains("### Note to Self"), "got:\n{md}");
+        assert!(!md.contains("\n# Note to Self"));
+    }
+
+    #[test]
+    fn demoting_headings_skips_fenced_code_and_caps_at_h6() {
+        let input = "# One\n```\n# not a heading\n```\n###### Six\nplain";
+        let out = super::demote_headings(input, 2);
+        assert!(out.contains("### One"));
+        assert!(
+            out.contains("\n# not a heading\n"),
+            "fence content changed:\n{out}"
+        );
+        assert!(out.contains("###### Six"), "must cap at h6:\n{out}");
+        assert!(out.contains("plain"));
+    }
+
+    #[test]
+    fn flags_notetaker_bots_without_touching_real_names() {
+        for bot in [
+            "Fireflies.ai Notetaker VK",
+            "Otter.ai",
+            "Read.ai meeting recorder",
+            "Some Note Taker",
+        ] {
+            assert!(looks_like_notetaker_bot(bot), "should flag: {bot}");
+        }
+        // Real participant names from live transcripts must never match.
+        for human in [
+            "Rae Nakamura",
+            "Sam Okafor",
+            "Panzerino",
+            "benton",
+            "Irad \"E-rod\" Eyal",
+            "Rob Zhang",
+        ] {
+            assert!(!looks_like_notetaker_bot(human), "should not flag: {human}");
+        }
+    }
+
+    #[test]
+    fn attribution_flags_bots_but_keeps_them_in_the_speaker_list() {
+        let transcript = json!([
+            { "source": "system", "text": "Hi.",
+              "detectedSpeaker": { "participantName": "Rae Nakamura" } },
+            { "source": "system", "text": "Recording.",
+              "detectedSpeaker": { "participantName": "Fireflies.ai Notetaker VK" } }
+        ]);
+        let summary = attribution_summary(&transcript);
+
+        // Flagged...
+        assert_eq!(
+            summary["likely_notetaker_bots"],
+            json!(["Fireflies.ai Notetaker VK"])
+        );
+        // ...but still present, because the detection is only a heuristic.
+        let names = summary["channels"][0]["detected_speaker_names"].clone();
+        assert_eq!(names, json!(["Fireflies.ai Notetaker VK", "Rae Nakamura"]));
     }
 
     #[test]

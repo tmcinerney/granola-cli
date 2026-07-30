@@ -17,8 +17,7 @@ mod output;
 mod prosemirror;
 
 use meetings::{
-    fetch_full_document, fetch_meetings_merged, format_transcript_segment, in_date_range,
-    in_timestamp_range, meeting_context_value, notes_markdown, resolve_meeting_id,
+    fetch_full_document, format_transcript_segment, meeting_context_value, resolve_meeting_id,
 };
 use output::Format;
 
@@ -36,6 +35,12 @@ struct Cli {
     command: Command,
 }
 
+// AIDEV-NOTE: the variants differ a lot in size (MeetingCmd carries every list
+// filter, Auth carries almost nothing), which clippy flags. Irrelevant here —
+// exactly one of these is constructed per process, from argv — and boxing it
+// would only obscure the match in main(). Started firing when ListArgs gained
+// --date/--offset to match the MCP surface.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     /// Manage authentication
@@ -85,11 +90,22 @@ struct OutputOpts {
     output: Format,
 }
 
+// AIDEV-NOTE: these arguments mirror meetings::MEETING_LIST_PARAMETERS. The
+// clap *ids* are what the drift test compares against the MCP tool schema, so
+// `--no-shared` carries the id `include_shared` (inverted when converted): each
+// front end keeps its idiomatic syntax while naming the same concept. Adding an
+// argument here without adding it to ListMeetingsArgs fails that test.
 #[derive(Args, Clone)]
 struct ListArgs {
     /// Maximum number of meetings to return
     #[arg(short = 'l', long, default_value_t = DEFAULT_LIST_LIMIT)]
     limit: u32,
+    /// Skip this many matching meetings before returning --limit
+    #[arg(long, default_value_t = 0)]
+    offset: u32,
+    /// Meetings on a single day (ISO YYYY-MM-DD); shorthand for --since/--until
+    #[arg(long)]
+    date: Option<String>,
     /// Lower bound — `today`, `7d`, `2h`, or ISO date
     #[arg(long)]
     since: Option<String>,
@@ -112,7 +128,7 @@ struct ListArgs {
     #[arg(short = 's', long)]
     search: Option<String>,
     /// Skip merging in shared (non-owned) documents
-    #[arg(long)]
+    #[arg(id = "include_shared", long = "no-shared")]
     no_shared: bool,
     #[command(flatten)]
     out: OutputOpts,
@@ -298,52 +314,25 @@ fn run_meeting(cmd: &MeetingCmd) -> Result<()> {
 }
 
 fn meeting_list(args: &ListArgs) -> Result<()> {
-    let created_since = args
-        .created_since
-        .as_deref()
-        .or(args.since.as_deref())
-        .map(output::parse_date_spec)
-        .transpose()
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let created_until = args
-        .created_until
-        .as_deref()
-        .or(args.until.as_deref())
-        .map(output::parse_date_spec)
-        .transpose()
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let updated_since = args
-        .updated_since
-        .as_deref()
-        .map(output::parse_date_spec)
-        .transpose()
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let updated_until = args
-        .updated_until
-        .as_deref()
-        .map(output::parse_date_spec)
-        .transpose()
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let search = args.search.as_deref().map(str::to_lowercase);
+    let query = meetings::MeetingQuerySpec {
+        date: args.date.as_deref(),
+        since: args.since.as_deref(),
+        until: args.until.as_deref(),
+        created_since: args.created_since.as_deref(),
+        created_until: args.created_until.as_deref(),
+        updated_since: args.updated_since.as_deref(),
+        updated_until: args.updated_until.as_deref(),
+        search: args.search.as_deref(),
+        limit: args.limit,
+        offset: args.offset,
+        include_shared: !args.no_shared,
+    }
+    .resolve()?;
 
-    let meetings = api::with_token_refresh(|c| {
-        fetch_meetings_merged(c, !args.no_shared).map_err(|e| api::Error::Transport(e.to_string()))
+    let page = api::with_token_refresh(|c| {
+        meetings::list_meetings(c, &query).map_err(|e| api::Error::Transport(e.to_string()))
     })?;
-
-    let filtered: Vec<Value> = meetings
-        .into_iter()
-        .filter(|m| in_date_range(m, created_since, created_until))
-        .filter(|m| in_timestamp_range(m, "updated_at", updated_since, updated_until))
-        .filter(|m| match &search {
-            Some(q) => m
-                .get("title")
-                .and_then(Value::as_str)
-                .map(|t| t.to_lowercase().contains(q))
-                .unwrap_or(false),
-            None => true,
-        })
-        .take(args.limit as usize)
-        .collect();
+    let filtered = page.meetings;
 
     match args.out.output {
         Format::Json | Format::Yaml => output::emit(&filtered, args.out.output),
@@ -379,10 +368,14 @@ fn meeting_notes(args: &IdArgs) -> Result<()> {
             resolve_meeting_id(c, &args.id).map_err(|e| api::Error::Transport(e.to_string()))?;
         fetch_full_document(c, &id)
     })?;
+    // AIDEV-NOTE: shows both your own notes and Granola's AI summary, matching
+    // granola_get_notes over MCP. These are separate documents, not fallbacks:
+    // preferring the panel silently hid notes you had typed yourself.
+    let notes = meetings::meeting_notes(&doc);
     if matches!(args.out.output, Format::Json | Format::Yaml) {
-        output::emit(&meetings::notes_document(&doc), args.out.output);
+        output::emit(&notes.to_json(), args.out.output);
     } else {
-        println!("{}", notes_markdown(&doc));
+        println!("{}", notes.render_markdown(None).trim_start());
     }
     Ok(())
 }
@@ -488,9 +481,7 @@ fn meeting_export(args: &ExportArgs) -> Result<()> {
         .get("title")
         .and_then(Value::as_str)
         .unwrap_or("(untitled)");
-    let notes = notes_markdown(&doc);
-
-    let mut out = format!("# {title}\n\n{notes}\n");
+    let mut out = meetings::meeting_notes(&doc).render_markdown(Some(title));
 
     if args.include_transcript {
         let transcript = api::with_token_refresh(|c| c.get_document_transcript(&resolved_id))?;
@@ -516,4 +507,70 @@ fn meeting_export(args: &ExportArgs) -> Result<()> {
         None => print!("{out}"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod surface_tests {
+    use clap::CommandFactory;
+    use std::collections::BTreeSet;
+
+    /// The CLI and the MCP tool must expose the same meeting-list parameters.
+    ///
+    /// AIDEV-NOTE: this is the guard that keeps the two front ends aligned. They
+    /// had already drifted seven ways before the shared query core existed
+    /// (`--no-shared` vs `owned_only`, MCP-only `date`/`offset`, and so on), and
+    /// nothing would have caught it. Compares clap argument *ids* against the
+    /// generated JSON schema properties, so each side keeps its idiomatic
+    /// syntax — `--no-shared` carries the id `include_shared` — while naming the
+    /// same concepts. If this fails, add the parameter to the other front end
+    /// and to meetings::MEETING_LIST_PARAMETERS rather than editing the
+    /// exclusion lists.
+    #[test]
+    fn cli_and_mcp_expose_the_same_list_parameters() {
+        let cmd = super::Cli::command();
+        let meeting = cmd
+            .get_subcommands()
+            .find(|c| c.get_name() == "meeting")
+            .expect("meeting subcommand");
+        let list = meeting
+            .get_subcommands()
+            .find(|c| c.get_name() == "list")
+            .expect("meeting list subcommand");
+
+        // `output` is excluded on purpose: the CLI offers table/yaml/text, which
+        // are meaningless over MCP, and it is a rendering choice not a filter.
+        let cli: BTreeSet<String> = list
+            .get_arguments()
+            .map(|a| a.get_id().to_string())
+            .filter(|id| id != "output" && id != "help")
+            .collect();
+
+        let schema = schemars::schema_for!(crate::mcp::ListMeetingsArgs);
+        let json = serde_json::to_value(&schema).expect("schema serialises");
+        let mcp: BTreeSet<String> = json["properties"]
+            .as_object()
+            .expect("schema has properties")
+            .keys()
+            .filter(|k| *k != "response_format")
+            .cloned()
+            .collect();
+
+        assert_eq!(
+            cli,
+            mcp,
+            "\nCLI-only:  {:?}\nMCP-only:  {:?}\n",
+            cli.difference(&mcp).collect::<Vec<_>>(),
+            mcp.difference(&cli).collect::<Vec<_>>()
+        );
+
+        // And both must match the canonical list the shared core documents.
+        let canonical: BTreeSet<String> = crate::meetings::MEETING_LIST_PARAMETERS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            cli, canonical,
+            "front ends disagree with MEETING_LIST_PARAMETERS"
+        );
+    }
 }

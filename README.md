@@ -128,9 +128,36 @@ error telling you to run `granola auth login`.
 | Tool | Returns |
 |---|---|
 | `granola_list_meetings` | Meetings newest-first, filterable by date range or title substring |
-| `granola_get_notes` | AI-enhanced notes for one meeting, as markdown |
-| `granola_get_transcript` | Full transcript for one meeting |
+| `granola_get_notes` | Both your own typed notes and Granola's AI summary, labelled |
+| `granola_get_transcript` | Full transcript, with per-segment speaker where Granola attributed one |
 | `granola_get_meeting_context` | Compact context: calendar window, attendees, per-channel attribution |
+
+### Two kinds of notes
+
+Granola stores two independent documents per meeting, and either may be absent:
+
+- **your notes** — what you typed during the call (`notes`, `notes_markdown`)
+- **AI-enhanced notes** — Granola's generated summary (`last_viewed_panel`)
+
+They are not fallbacks for one another, so `granola_get_notes` and `granola
+meeting notes` return both under `## My notes` and `## AI-enhanced notes`
+headings (or `{my_notes, ai_notes}` in JSON). Roughly a quarter of meetings have
+both. `granola_list_meetings` reports `has_own_notes` per meeting, so finding the
+meetings you took notes in doesn't need a fetch per meeting.
+
+### Speaker attribution
+
+A transcript segment's `source` is an **audio channel, not a person** — `system`
+routinely carries every remote participant in one stream. Only a name Granola
+itself attached to a segment is reported as a speaker; nothing is ever inferred
+from the calendar. In JSON each segment gains a flattened `speaker` alongside the
+raw fields.
+
+Automated notetakers (Fireflies, Otter, Read.ai and similar) are **flagged, not
+removed**: `speaker_is_likely_bot` per segment and `likely_notetaker_bots` in the
+context payload. The detection is a name heuristic, so a false positive must not
+be able to erase a real participant — callers subtract the set if they want
+humans only.
 
 `granola_list_meetings` accepts `since` / `until` (ISO date, RFC3339, `today`,
 `yesterday`, or a relative span like `7d`), `date` for a single day, `search`,
@@ -151,6 +178,18 @@ on a specific meeting.
 In JSON the response is `{ total_matched, offset, count, meetings }`. Page with
 `offset` — MCP has no cursor pagination for tool results, so `total_matched` is
 how you tell "that's everything" from "there's more".
+
+### CLI and MCP stay in step
+
+Both front ends are adapters over one shared query implementation, so the same
+filters behave identically whichever you use. A test compares the CLI's argument
+ids against the MCP tool schema and fails if either side gains a parameter alone.
+
+Each keeps its own idiom where that's natural — the CLI spells "owned only" as
+`--no-shared` while MCP takes `include_shared` — and output formatting differs by
+design, since `--output table` is meaningless over MCP. The one deliberate
+behavioural difference is the default `limit`: 20 for the CLI, 50 for MCP. Both
+accept `limit` explicitly.
 
 ### Client setup
 

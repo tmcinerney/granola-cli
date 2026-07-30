@@ -21,15 +21,23 @@ use serde_json::Value;
 
 use crate::api;
 use crate::meetings;
-use crate::output;
 
-/// Default page size, matching the retired Python server rather than the CLI's
-/// smaller interactive default.
+/// Default page size for MCP callers.
+///
+/// AIDEV-NOTE: deliberately higher than the CLI's DEFAULT_LIST_LIMIT of 20.
+/// This is the one place the two front ends intentionally differ: a human
+/// scanning a terminal table wants a short list, whereas an agent filtering
+/// programmatically over compact summaries wants a useful window. `limit` is a
+/// parameter on both sides, so either caller can override, and clamping lives
+/// in the shared core. Keep any divergence to defaults — never to behaviour.
 const DEFAULT_LIMIT: u32 = 50;
-const MAX_LIMIT: u32 = 200;
 
 fn default_limit() -> u32 {
     DEFAULT_LIMIT
+}
+
+fn default_include_shared() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema)]
@@ -89,17 +97,27 @@ pub struct ListMeetingsArgs {
     /// Output format.
     #[serde(default)]
     pub response_format: ResponseFormat,
-    /// Exclude meetings shared with you, returning only ones you own.
-    #[serde(default)]
-    pub owned_only: bool,
+    /// Include meetings shared with you as well as ones you own.
+    #[serde(default = "default_include_shared")]
+    pub include_shared: bool,
 }
 
+// AIDEV-NOTE: notes default to markdown rather than json because they are prose
+// and the labelled headings are the readable form; the other tools default to
+// json. Both remain available on either.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct MeetingIdArgs {
+pub struct NotesArgs {
     /// Granola meeting ID from `granola_list_meetings`. A unique ID prefix also
     /// resolves.
     pub meeting_id: String,
+    /// Output format.
+    #[serde(default = "markdown_format")]
+    pub response_format: ResponseFormat,
+}
+
+fn markdown_format() -> ResponseFormat {
+    ResponseFormat::Markdown
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -144,15 +162,6 @@ fn reply(result: Result<String, String>) -> Result<CallToolResult, ErrorData> {
         Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
         Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
     })
-}
-
-fn parse_bound(spec: Option<&str>) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
-    match spec {
-        None => Ok(None),
-        Some(s) => output::parse_date_spec(s)
-            .map(Some)
-            .map_err(|e| anyhow::anyhow!("{e}")),
-    }
 }
 
 fn meeting_markdown(m: &Value) -> String {
@@ -207,6 +216,25 @@ fn attendee_label(attendee: &Value) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
+/// Copy a transcript segment, adding a flattened speaker name and a bot flag.
+fn annotate_segment(segment: &Value) -> Value {
+    let mut out = segment.clone();
+    let speaker = meetings::segment_speaker_name(segment);
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert(
+            "speaker".into(),
+            speaker
+                .map(|s| Value::String(s.into()))
+                .unwrap_or(Value::Null),
+        );
+        obj.insert(
+            "speaker_is_likely_bot".into(),
+            Value::Bool(speaker.is_some_and(meetings::looks_like_notetaker_bot)),
+        );
+    }
+    out
+}
+
 fn transcript_markdown(transcript: &Value) -> String {
     let mut lines = vec!["# Transcript".to_string(), String::new()];
     for segment in transcript.as_array().into_iter().flatten() {
@@ -230,6 +258,9 @@ fn transcript_markdown(transcript: &Value) -> String {
         // carry several remote participants. Only a name Granola itself put on
         // the segment is shown as a speaker; never infer one from attendees.
         let speaker = match meetings::segment_speaker_name(segment) {
+            Some(name) if meetings::looks_like_notetaker_bot(name) => {
+                format!("**{name}** _(notetaker bot)_")
+            }
             Some(name) => format!("**{name}**"),
             None => format!("**{source} audio**"),
         };
@@ -252,86 +283,53 @@ impl GranolaServer {
     ) -> Result<CallToolResult, ErrorData> {
         reply(
             blocking(move || {
-                let limit = args.limit.clamp(1, MAX_LIMIT);
+                let query = meetings::MeetingQuerySpec {
+                    date: args.date.as_deref(),
+                    since: args.since.as_deref(),
+                    until: args.until.as_deref(),
+                    created_since: args.created_since.as_deref(),
+                    created_until: args.created_until.as_deref(),
+                    updated_since: args.updated_since.as_deref(),
+                    updated_until: args.updated_until.as_deref(),
+                    search: args.search.as_deref(),
+                    limit: args.limit,
+                    offset: args.offset,
+                    include_shared: args.include_shared,
+                }
+                .resolve()?;
 
-                // `date` is sugar for a single-day window; explicit bounds win.
-                let (date_since, date_until) = match args.date.as_deref() {
-                    Some(day) => {
-                        let start = output::parse_date_spec(day)
-                            .map_err(|e| anyhow::anyhow!("invalid `date`: {e}"))?;
-                        (Some(start), Some(start + chrono::Duration::days(1)))
-                    }
-                    None => (None, None),
-                };
-
-                let created_since =
-                    parse_bound(args.created_since.as_deref().or(args.since.as_deref()))?
-                        .or(date_since);
-                let created_until =
-                    parse_bound(args.created_until.as_deref().or(args.until.as_deref()))?
-                        .or(date_until);
-                let updated_since = parse_bound(args.updated_since.as_deref())?;
-                let updated_until = parse_bound(args.updated_until.as_deref())?;
-                let search = args.search.as_deref().map(str::to_lowercase);
-
-                let meetings = api::with_token_refresh(|c| {
-                    meetings::fetch_meetings_merged(c, !args.owned_only)
+                let page = api::with_token_refresh(|c| {
+                    meetings::list_meetings(c, &query)
                         .map_err(|e| api::Error::Transport(e.to_string()))
                 })?;
 
-                // AIDEV-NOTE: matched is collected before limit/offset so the
-                // response can report a total. Without it a caller cannot tell
-                // "that is everything" from "there is more", which is the only
-                // thing that makes `offset` usable — MCP has no cursor
-                // pagination for tool *results*, so paging has to be explicit
-                // in the payload.
-                let matched: Vec<Value> = meetings
-                    .into_iter()
-                    .filter(|m| meetings::in_date_range(m, created_since, created_until))
-                    .filter(|m| {
-                        meetings::in_timestamp_range(m, "updated_at", updated_since, updated_until)
-                    })
-                    .filter(|m| match &search {
-                        Some(q) => m
-                            .get("title")
-                            .and_then(Value::as_str)
-                            .map(|t| t.to_lowercase().contains(q))
-                            .unwrap_or(false),
-                        None => true,
-                    })
-                    .collect();
-                let total_matched = matched.len();
-                let filtered: Vec<&Value> = matched
-                    .iter()
-                    .skip(args.offset as usize)
-                    .take(limit as usize)
-                    .collect();
-
                 Ok(match args.response_format {
                     ResponseFormat::Json => {
-                        let summaries: Vec<Value> = filtered
+                        let summaries: Vec<Value> = page
+                            .meetings
                             .iter()
-                            .map(|m| meetings::meeting_summary(m))
+                            .map(meetings::meeting_summary)
                             .collect();
                         serde_json::to_string_pretty(&serde_json::json!({
-                            "total_matched": total_matched,
-                            "offset": args.offset,
+                            "total_matched": page.total_matched,
+                            "offset": page.offset,
                             "count": summaries.len(),
                             "meetings": summaries,
                         }))?
                     }
                     ResponseFormat::Markdown => {
-                        let mut out = if total_matched > filtered.len() {
+                        let shown = page.meetings.len();
+                        let mut out = if page.total_matched > shown {
                             format!(
                                 "# Meetings ({}-{} of {})\n",
-                                args.offset as usize + 1,
-                                args.offset as usize + filtered.len(),
-                                total_matched
+                                page.offset as usize + 1,
+                                page.offset as usize + shown,
+                                page.total_matched
                             )
                         } else {
-                            format!("# Meetings ({} found)\n", filtered.len())
+                            format!("# Meetings ({shown} found)\n")
                         };
-                        for m in &filtered {
+                        for m in &page.meetings {
                             out.push('\n');
                             out.push_str(&meeting_markdown(m));
                             out.push('\n');
@@ -346,11 +344,13 @@ impl GranolaServer {
 
     #[tool(
         name = "granola_get_notes",
-        description = "Get the AI-enhanced notes for one Granola meeting, as markdown."
+        description = "Get the notes for one Granola meeting: both the notes the user typed \
+                       during the call and Granola's AI-enhanced summary, labelled separately. \
+                       They are different documents and either may be absent."
     )]
     async fn get_notes(
         &self,
-        Parameters(args): Parameters<MeetingIdArgs>,
+        Parameters(args): Parameters<NotesArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         reply(
             blocking(move || {
@@ -359,11 +359,11 @@ impl GranolaServer {
                         .map_err(|e| api::Error::Transport(e.to_string()))?;
                     meetings::fetch_full_document(c, &id)
                 })?;
-                let notes = meetings::notes_markdown(&doc);
-                Ok(if notes.trim().is_empty() {
-                    "This meeting has no notes.".to_string()
-                } else {
-                    notes
+                let title = doc.get("title").and_then(Value::as_str);
+                let notes = meetings::meeting_notes(&doc);
+                Ok(match args.response_format {
+                    ResponseFormat::Json => serde_json::to_string_pretty(&notes.to_json())?,
+                    ResponseFormat::Markdown => notes.render_markdown(title),
                 })
             })
             .await,
@@ -388,7 +388,17 @@ impl GranolaServer {
                     c.get_document_transcript(&id)
                 })?;
                 Ok(match args.response_format {
-                    ResponseFormat::Json => serde_json::to_string_pretty(&transcript)?,
+                    // AIDEV-NOTE: raw segments are preserved and `speaker` /
+                    // `speaker_is_likely_bot` added alongside, so a caller does
+                    // not have to know to dig into detectedSpeaker, and nothing
+                    // upstream is hidden.
+                    ResponseFormat::Json => {
+                        let annotated: Vec<Value> = transcript
+                            .as_array()
+                            .map(|segs| segs.iter().map(annotate_segment).collect())
+                            .unwrap_or_default();
+                        serde_json::to_string_pretty(&annotated)?
+                    }
                     ResponseFormat::Markdown => transcript_markdown(&transcript),
                 })
             })
@@ -515,7 +525,7 @@ pub fn run() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ListMeetingsArgs, MeetingIdArgs, ResponseFormat};
+    use super::{ListMeetingsArgs, NotesArgs, ResponseFormat};
 
     /// Regression: unknown arguments must be rejected, not silently ignored.
     ///
@@ -543,8 +553,16 @@ mod tests {
 
     #[test]
     fn id_args_reject_unknown_fields() {
-        assert!(serde_json::from_str::<MeetingIdArgs>(r#"{"meeting_id":"abc"}"#).is_ok());
-        assert!(serde_json::from_str::<MeetingIdArgs>(r#"{"meetingId":"abc"}"#).is_err());
+        assert!(serde_json::from_str::<NotesArgs>(r#"{"meeting_id":"abc"}"#).is_ok());
+        assert!(serde_json::from_str::<NotesArgs>(r#"{"meetingId":"abc"}"#).is_err());
+    }
+
+    /// Notes are prose, so this one tool defaults to markdown while the others
+    /// default to json. Assert that deliberately, so it is not "fixed" later.
+    #[test]
+    fn notes_default_to_markdown() {
+        let args: NotesArgs = serde_json::from_str(r#"{"meeting_id":"abc"}"#).unwrap();
+        assert!(matches!(args.response_format, ResponseFormat::Markdown));
     }
 
     #[test]
