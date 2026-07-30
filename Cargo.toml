@@ -1,15 +1,19 @@
 [package]
 name = "granola-cli"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-rust-version = "1.74"
-description = "Unofficial CLI for Granola meeting notes (with credential-storage fix for Granola desktop ≥7.162)"
+# AIDEV-NOTE: raised from 1.74 by rmcp 3, which is edition 2024 and declares
+# rust-version 1.88 (as do its darling/rmcp-macros deps). CI only builds on
+# `stable`, so it will not catch this drifting out of date — check with
+# `cargo metadata` when bumping deps.
+rust-version = "1.88"
+description = "Unofficial CLI and MCP server for Granola meeting notes (with credential-storage fix for Granola desktop ≥7.162)"
 authors = ["Travers McInerney"]
 license = "MIT"
 repository = "https://github.com/tmcinerney/granola-cli"
 homepage = "https://github.com/tmcinerney/granola-cli"
 readme = "README.md"
-keywords = ["granola", "cli", "meetings", "transcripts"]
+keywords = ["granola", "cli", "meetings", "transcripts", "mcp"]
 categories = ["command-line-utilities"]
 
 [[bin]]
@@ -35,6 +39,13 @@ chrono = { version = "0.4", features = ["serde", "clock"] }
 comfy-table = "7"
 pbkdf2 = "0.12"
 sha1 = "0.10"
+# AIDEV-NOTE: MCP server behind `granola mcp`. rmcp's default features already
+# include `macros` + `server`; `transport-io` is what adds the stdio transport.
+# `server` pulls in schemars 1.x and the tool-argument structs derive JsonSchema
+# against it, so keep the schemars major in step with rmcp's when bumping either.
+rmcp = { version = "3", features = ["transport-io"] }
+schemars = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [dev-dependencies]
 pretty_assertions = "1"
