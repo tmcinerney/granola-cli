@@ -137,6 +137,10 @@ error telling you to run `granola auth login`.
 `limit`, and `response_format` (`json` or `markdown`). The rest take a
 `meeting_id` — a full ID or any unique prefix.
 
+Arguments are passed flat, and unrecognised ones are rejected rather than
+ignored, so a typo fails loudly instead of silently returning an unfiltered
+list. The tool schemas advertise this as `additionalProperties: false`.
+
 ### Client setup
 
 Most clients take a command and args. For Claude Desktop

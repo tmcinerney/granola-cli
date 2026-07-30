@@ -42,7 +42,14 @@ pub enum ResponseFormat {
     Markdown,
 }
 
+// AIDEV-NOTE: deny_unknown_fields is load-bearing for an agent-facing API, and
+// restores parity with the retired Python server's `extra="forbid"`. Without it
+// serde silently ignores unrecognised keys, so a typo'd or wrongly-nested
+// argument object deserialises to all-defaults — an unfiltered list of 50 full
+// documents — instead of erroring. That reads to the caller as a working tool
+// returning the wrong thing, which is far worse than a rejected call.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListMeetingsArgs {
     /// Meetings on a single day. ISO `YYYY-MM-DD`. Shorthand for setting
     /// `since` to that day and `until` to the next.
@@ -84,6 +91,7 @@ pub struct ListMeetingsArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MeetingIdArgs {
     /// Granola meeting ID from `granola_list_meetings`. A unique ID prefix also
     /// resolves.
@@ -91,6 +99,7 @@ pub struct MeetingIdArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MeetingIdFormatArgs {
     /// Granola meeting ID from `granola_list_meetings`. A unique ID prefix also
     /// resolves.
@@ -467,4 +476,54 @@ pub fn run() -> Result<()> {
             service.waiting().await?;
             Ok(())
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ListMeetingsArgs, MeetingIdArgs, ResponseFormat};
+
+    /// Regression: unknown arguments must be rejected, not silently ignored.
+    ///
+    /// Without `deny_unknown_fields`, a wrongly-nested `{"params": {...}}`
+    /// deserialised to all-defaults and the tool returned an unfiltered list of
+    /// 50 full documents as a *success*, which reads as a working tool giving
+    /// the wrong answer.
+    #[test]
+    fn list_args_reject_wrongly_nested_params() {
+        let err = serde_json::from_str::<ListMeetingsArgs>(r#"{"params":{"limit":2}}"#)
+            .expect_err("a nested params object must not deserialise to defaults");
+        assert!(
+            err.to_string().contains("unknown field"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn list_args_reject_misspelled_field() {
+        assert!(serde_json::from_str::<ListMeetingsArgs>(r#"{"limitt":2}"#).is_err());
+        assert!(
+            serde_json::from_str::<ListMeetingsArgs>(r#"{"limit":2,"nonsense":true}"#).is_err()
+        );
+    }
+
+    #[test]
+    fn id_args_reject_unknown_fields() {
+        assert!(serde_json::from_str::<MeetingIdArgs>(r#"{"meeting_id":"abc"}"#).is_ok());
+        assert!(serde_json::from_str::<MeetingIdArgs>(r#"{"meetingId":"abc"}"#).is_err());
+    }
+
+    #[test]
+    fn list_args_accept_documented_shape_and_defaults() {
+        let args: ListMeetingsArgs =
+            serde_json::from_str(r#"{"since":"7d","limit":2,"response_format":"markdown"}"#)
+                .expect("the documented flat shape must deserialise");
+        assert_eq!(args.limit, 2);
+        assert!(matches!(args.response_format, ResponseFormat::Markdown));
+
+        // Everything is optional; an empty object is a valid "recent meetings" call.
+        let defaults: ListMeetingsArgs = serde_json::from_str("{}").expect("all fields optional");
+        assert_eq!(defaults.limit, super::DEFAULT_LIMIT);
+        assert!(matches!(defaults.response_format, ResponseFormat::Json));
+        assert!(defaults.since.is_none());
+    }
 }
