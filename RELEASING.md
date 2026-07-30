@@ -119,7 +119,7 @@ Remove the release worktree and branch after the release and tap update are
 done:
 
 ```sh
-cd /Users/tmcinerney/Code/Public/granola-cli
+cd path/to/granola-cli
 git worktree remove .worktrees/release-v0.1.4
 git branch -d release/v0.1.4
 ```

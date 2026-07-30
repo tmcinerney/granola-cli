@@ -412,31 +412,31 @@ mod tests {
 
     #[test]
     fn keeps_full_meeting_uuid() {
-        let meetings = vec![json!({ "id": "bdb68fba-fdf4-4b97-b7e2-b63deca0f234" })];
+        let meetings = vec![json!({ "id": "aaaaaaaa-1111-4111-8111-111111111111" })];
         let resolved =
-            resolve_meeting_id_from_documents("bdb68fba-fdf4-4b97-b7e2-b63deca0f234", &meetings)
+            resolve_meeting_id_from_documents("aaaaaaaa-1111-4111-8111-111111111111", &meetings)
                 .expect("full id should be preserved");
-        assert_eq!(resolved, "bdb68fba-fdf4-4b97-b7e2-b63deca0f234");
+        assert_eq!(resolved, "aaaaaaaa-1111-4111-8111-111111111111");
     }
 
     #[test]
     fn resolves_unique_short_prefix() {
         let meetings = vec![
-            json!({ "id": "bdb68fba-fdf4-4b97-b7e2-b63deca0f234" }),
-            json!({ "id": "fa148cc7-b834-4dfd-9a58-8f93fb069022" }),
+            json!({ "id": "aaaaaaaa-1111-4111-8111-111111111111" }),
+            json!({ "id": "bbbbbbbb-2222-4222-8222-222222222222" }),
         ];
-        let resolved = resolve_meeting_id_from_documents("bdb68fba", &meetings)
+        let resolved = resolve_meeting_id_from_documents("aaaaaaaa", &meetings)
             .expect("short prefix should resolve");
-        assert_eq!(resolved, "bdb68fba-fdf4-4b97-b7e2-b63deca0f234");
+        assert_eq!(resolved, "aaaaaaaa-1111-4111-8111-111111111111");
     }
 
     #[test]
     fn errors_on_ambiguous_prefix() {
         let meetings = vec![
-            json!({ "id": "bdb68fba-fdf4-4b97-b7e2-b63deca0f234" }),
-            json!({ "id": "bdb68fba-1111-4b97-b7e2-b63deca0f235" }),
+            json!({ "id": "aaaaaaaa-1111-4111-8111-111111111111" }),
+            json!({ "id": "aaaaaaaa-3333-4333-8333-333333333333" }),
         ];
-        let err = resolve_meeting_id_from_documents("bdb68fba", &meetings)
+        let err = resolve_meeting_id_from_documents("aaaaaaaa", &meetings)
             .expect_err("ambiguous prefix should fail");
         assert!(
             err.to_string().contains("matched multiple recent meetings"),
@@ -446,7 +446,7 @@ mod tests {
 
     #[test]
     fn errors_on_missing_prefix() {
-        let meetings = vec![json!({ "id": "bdb68fba-fdf4-4b97-b7e2-b63deca0f234" })];
+        let meetings = vec![json!({ "id": "aaaaaaaa-1111-4111-8111-111111111111" })];
         let err = resolve_meeting_id_from_documents("deadbeef", &meetings)
             .expect_err("missing prefix should fail");
         assert!(
@@ -461,7 +461,7 @@ mod tests {
             "source": "system",
             "start_timestamp": "2026-07-22T16:31:21.054Z",
             "text": "Thanks for that.",
-            "detectedSpeaker": { "participantName": "Gary Grossman" }
+            "detectedSpeaker": { "participantName": "Rae Nakamura" }
         });
 
         assert_eq!(
@@ -470,7 +470,7 @@ mod tests {
                 "channels": [{
                     "source": "system",
                     "segment_count": 1,
-                    "detected_speaker_names": ["Gary Grossman"]
+                    "detected_speaker_names": ["Rae Nakamura"]
                 }],
                 "speaker_attribution": "Only names present in raw transcript segments are listed; no calendar-based inference is applied."
             })
@@ -483,7 +483,7 @@ mod tests {
             "source": "microphone",
             "start_timestamp": "2026-07-22T16:31:21.054Z",
             "text": "Hello.",
-            "detected_speaker_name": "Travers"
+            "detected_speaker_name": "Sam"
         });
 
         assert_eq!(
@@ -492,7 +492,7 @@ mod tests {
                 "channels": [{
                     "source": "microphone",
                     "segment_count": 1,
-                    "detected_speaker_names": ["Travers"]
+                    "detected_speaker_names": ["Sam"]
                 }],
                 "speaker_attribution": "Only names present in raw transcript segments are listed; no calendar-based inference is applied."
             })
@@ -505,24 +505,24 @@ mod tests {
             "source": "system",
             "start_timestamp": "2026-07-22T16:31:21.054Z",
             "text": "Hello.",
-            "detectedSpeaker": { "participantName": "Gary Grossman" }
+            "detectedSpeaker": { "participantName": "Rae Nakamura" }
         });
 
         assert_eq!(
             format_transcript_segment(&segment),
-            "[2026-07-22T16:31:21.054Z] (system; speaker: Gary Grossman) Hello."
+            "[2026-07-22T16:31:21.054Z] (system; speaker: Rae Nakamura) Hello."
         );
     }
 
     #[test]
     fn attribution_summary_does_not_infer_names_for_unnamed_channels() {
         let transcript = json!([
-            { "source": "microphone", "text": "Hey Gary." },
+            { "source": "microphone", "text": "Hey Rae." },
             { "source": "system", "text": "Hi." },
             {
                 "source": "system",
                 "text": "Thanks.",
-                "detectedSpeaker": { "participantName": "Gary Grossman" }
+                "detectedSpeaker": { "participantName": "Rae Nakamura" }
             }
         ]);
 
@@ -538,7 +538,7 @@ mod tests {
                     {
                         "source": "system",
                         "segment_count": 2,
-                        "detected_speaker_names": ["Gary Grossman"]
+                        "detected_speaker_names": ["Rae Nakamura"]
                     }
                 ],
                 "speaker_attribution": "Only names present in raw transcript segments are listed; no calendar-based inference is applied."
@@ -550,7 +550,7 @@ mod tests {
     fn context_is_compact_and_omits_raw_sensitive_fields() {
         let document = json!({
             "id": "meeting-123",
-            "title": "Gary / Travers",
+            "title": "Rae / Sam",
             "last_viewed_panel": {
                 "content": {
                     "type": "doc",
@@ -559,8 +559,8 @@ mod tests {
             },
             "unrecognized_document_field": { "kept": true },
             "people": {
-                "creator": { "email": "person@example.com", "name": "Travers McInerney" },
-                "attendees": [{ "details": { "person": { "name": { "fullName": "Gary" } } } }]
+                "creator": { "email": "person@example.com", "name": "Sam Okafor" },
+                "attendees": [{ "details": { "person": { "name": { "fullName": "Rae" } } } }]
             },
             "google_calendar_event": {
                 "start": { "dateTime": "2026-07-22T17:00:00Z", "timeZone": "America/Los_Angeles" },
@@ -586,11 +586,11 @@ mod tests {
         );
         assert_eq!(
             context.pointer("/people/creator_name"),
-            Some(&json!("Travers McInerney"))
+            Some(&json!("Sam Okafor"))
         );
         assert_eq!(
             context.pointer("/people/attendee_names"),
-            Some(&json!(["Gary"]))
+            Some(&json!(["Rae"]))
         );
         assert!(context.pointer("/document/people").is_none());
         assert!(context.pointer("/document/url").is_none());
