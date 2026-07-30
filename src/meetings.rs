@@ -239,7 +239,7 @@ pub(crate) fn format_transcript_segment(seg: &Value) -> String {
         .get("start_timestamp")
         .and_then(Value::as_str)
         .unwrap_or("");
-    match detected_speaker_name(seg) {
+    match segment_speaker_name(seg) {
         Some(speaker) => format!("[{ts}] ({source}; speaker: {speaker}) {text}"),
         None => format!("[{ts}] ({source}) {text}"),
     }
@@ -248,7 +248,7 @@ pub(crate) fn format_transcript_segment(seg: &Value) -> String {
 /// Return only speaker identity supplied by Granola's transcript payload.
 /// In particular, this must not infer a remote name from calendar attendees:
 /// a `system` audio channel can contain multiple remote participants.
-fn detected_speaker_name(seg: &Value) -> Option<&str> {
+pub(crate) fn segment_speaker_name(seg: &Value) -> Option<&str> {
     seg.pointer("/detectedSpeaker/participantName")
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())
@@ -269,7 +269,7 @@ pub(crate) fn attribution_summary(transcript: &Value) -> Value {
             .to_string();
         let entry = channels.entry(source).or_default();
         entry.0 += 1;
-        if let Some(name) = detected_speaker_name(segment) {
+        if let Some(name) = segment_speaker_name(segment) {
             entry.1.insert(name.to_string());
         }
     }

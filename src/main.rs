@@ -11,6 +11,7 @@ use serde_json::Value;
 
 mod api;
 mod auth;
+mod mcp;
 mod meetings;
 mod output;
 mod prosemirror;
@@ -43,6 +44,12 @@ enum Command {
     /// Work with meetings
     #[command(subcommand)]
     Meeting(MeetingCmd),
+    /// Serve meeting data to AI clients over the Model Context Protocol
+    ///
+    /// AIDEV-NOTE: speaks JSON-RPC on stdin/stdout, so it is meant to be
+    /// spawned by an MCP client rather than run interactively. Anything printed
+    /// to stdout by this subcommand corrupts the protocol stream.
+    Mcp,
 }
 
 #[derive(Subcommand)]
@@ -147,6 +154,7 @@ fn main() -> ExitCode {
     let result = match &cli.command {
         Command::Auth(c) => run_auth(c),
         Command::Meeting(c) => run_meeting(c),
+        Command::Mcp => mcp::run(),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
