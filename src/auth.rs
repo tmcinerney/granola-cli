@@ -12,13 +12,13 @@
 #[cfg(any(target_os = "macos", test))]
 use aes::Aes128;
 #[cfg(any(target_os = "macos", test))]
-use aes_gcm::aead::{AeadInPlace, KeyInit};
+use aes_gcm::aead::{AeadInOut, KeyInit};
 #[cfg(any(target_os = "macos", test))]
 use aes_gcm::{Aes256Gcm, Nonce, Tag};
 #[cfg(target_os = "macos")]
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 #[cfg(any(target_os = "macos", test))]
-use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+use cbc::cipher::{block_padding::Pkcs7, BlockModeDecrypt, KeyIvInit};
 #[cfg(any(target_os = "macos", test))]
 use cbc::Decryptor;
 #[cfg(any(target_os = "macos", test))]
@@ -299,13 +299,11 @@ fn decrypt_mac_safe_storage_value(encrypted_value: &[u8], password: &str) -> Res
     let cipher = Aes128CbcDec::new_from_slices(&key, &MAC_SAFE_STORAGE_IV).map_err(|e| {
         Error::EncryptedDesktopCredentials(format!("invalid safe-storage cipher parameters: {e}"))
     })?;
-    let decrypted = cipher
-        .decrypt_padded_vec_mut::<Pkcs7>(payload)
-        .map_err(|e| {
-            Error::EncryptedDesktopCredentials(format!(
-                "could not decrypt Granola safe-storage key: {e}"
-            ))
-        })?;
+    let decrypted = cipher.decrypt_padded_vec::<Pkcs7>(payload).map_err(|e| {
+        Error::EncryptedDesktopCredentials(format!(
+            "could not decrypt Granola safe-storage key: {e}"
+        ))
+    })?;
 
     String::from_utf8(decrypted).map_err(|e| {
         Error::EncryptedDesktopCredentials(format!(
@@ -338,14 +336,26 @@ fn decrypt_granola_storage(encrypted_value: &[u8], dek: &[u8]) -> Result<String,
             "invalid Granola storage cipher parameters: {e}"
         ))
     })?;
+    // AIDEV-NOTE: aead 0.6 moved the slice-based detached helpers onto the
+    // deprecated AeadInPlace trait, and CI builds with `-D warnings`, so this
+    // uses the current `decrypt_inout_detached` + InOutBuf form. Nonce/Tag are
+    // fixed-size arrays now, hence TryFrom rather than the deprecated
+    // `from_slice` (which panicked on a length mismatch instead of erroring).
+    let nonce = Nonce::try_from(iv).map_err(|_| {
+        Error::EncryptedDesktopCredentials(format!(
+            "Granola storage nonce was {} bytes, expected {GRANOLA_STORAGE_IV_LENGTH}",
+            iv.len()
+        ))
+    })?;
+    let tag = Tag::try_from(auth_tag).map_err(|_| {
+        Error::EncryptedDesktopCredentials(format!(
+            "Granola storage auth tag was {} bytes, expected {GRANOLA_STORAGE_AUTH_TAG_LENGTH}",
+            auth_tag.len()
+        ))
+    })?;
     let mut decrypted = encrypted_payload.to_vec();
     cipher
-        .decrypt_in_place_detached(
-            Nonce::from_slice(iv),
-            b"",
-            &mut decrypted,
-            Tag::from_slice(auth_tag),
-        )
+        .decrypt_inout_detached(&nonce, b"", decrypted.as_mut_slice().into(), &tag)
         .map_err(|e| {
             Error::EncryptedDesktopCredentials(format!(
                 "could not decrypt Granola desktop storage: {e}"
@@ -675,12 +685,12 @@ pub fn refresh_access_token() -> Result<Credentials, Error> {
 mod tests {
     use super::*;
     use aes::Aes128;
-    use aes_gcm::aead::{AeadInPlace, KeyInit};
+    use aes_gcm::aead::{AeadInOut, KeyInit};
     use aes_gcm::{Aes256Gcm, Nonce};
     use base64::prelude::BASE64_STANDARD;
     #[cfg(not(target_os = "macos"))]
     use base64::Engine as _;
-    use cbc::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
+    use cbc::cipher::{block_padding::Pkcs7, BlockModeEncrypt, KeyIvInit};
     use cbc::Encryptor;
     use pbkdf2::pbkdf2_hmac;
     use sha1::Sha1;
@@ -698,7 +708,7 @@ mod tests {
 
         let cipher = Aes128CbcEnc::new_from_slices(&key, &MAC_SAFE_STORAGE_IV).unwrap();
         let mut encrypted = MAC_SAFE_STORAGE_PREFIX.to_vec();
-        encrypted.extend(cipher.encrypt_padded_vec_mut::<Pkcs7>(value.as_bytes()));
+        encrypted.extend(cipher.encrypt_padded_vec::<Pkcs7>(value.as_bytes()));
         encrypted
     }
 
@@ -706,8 +716,9 @@ mod tests {
         let iv = [7_u8; GRANOLA_STORAGE_IV_LENGTH];
         let cipher = Aes256Gcm::new_from_slice(dek).unwrap();
         let mut encrypted = value.as_bytes().to_vec();
+        let nonce = Nonce::try_from(&iv[..]).unwrap();
         let tag = cipher
-            .encrypt_in_place_detached(Nonce::from_slice(&iv), b"", &mut encrypted)
+            .encrypt_inout_detached(&nonce, b"", encrypted.as_mut_slice().into())
             .unwrap();
 
         let mut blob = Vec::with_capacity(iv.len() + encrypted.len() + tag.len());
