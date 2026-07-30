@@ -1,21 +1,25 @@
 # granola-cli
 
-A Rust CLI for [Granola](https://granola.ai/) meeting notes, with a fix for
-the credential-storage break introduced in Granola desktop ≥7.162.
+A Rust CLI and MCP server for [Granola](https://granola.ai/) meeting notes, with
+a fix for the credential-storage break introduced in Granola desktop ≥7.162.
 
 This is a Rust port of [`magarcia/granola-cli`](https://github.com/magarcia/granola-cli)
 incorporating the credential-discovery fix from
 [PR #6](https://github.com/magarcia/granola-cli/pull/6) so authentication
 keeps working on current Granola desktop versions.
 
-The repo also serves as a [Claude Code](https://claude.com/claude-code) plugin
-marketplace. Install the plugin and you get four skills that wrap the CLI for
-agentic use:
+One binary, three ways to use it:
 
-- `granola-recent` — fetch recent meetings
-- `granola-notes` — look up notes by title or date
-- `granola-export` — save meeting markdown to disk
-- `granola-search` — search across recent meetings
+- a **command-line tool** — `granola meeting list`, `granola meeting notes <id>`, …
+- an **[MCP](https://modelcontextprotocol.io) server** — `granola mcp`, exposing
+  meetings, notes and transcripts as tools to any MCP client
+  (see [MCP server](#mcp-server))
+- a **[Claude Code](https://claude.com/claude-code) plugin** — the repo doubles as
+  a plugin marketplace with four skills that wrap the CLI for agentic use:
+  - `granola-recent` — fetch recent meetings
+  - `granola-notes` — look up notes by title or date
+  - `granola-export` — save meeting markdown to disk
+  - `granola-search` — search across recent meetings
 
 ---
 
@@ -103,6 +107,60 @@ show those optional names without replacing the raw channel label.
 
 ---
 
+## MCP server
+
+The same binary is also an [MCP](https://modelcontextprotocol.io) server, so AI
+clients can query your Granola data directly:
+
+```sh
+granola mcp
+```
+
+It speaks JSON-RPC over stdin/stdout, so it is meant to be spawned by an MCP
+client rather than run by hand. Authentication is shared with the CLI — run
+`granola auth login` once in a terminal and the server uses the same keychain
+credentials, refreshing them automatically. It never prompts for login itself,
+since it has no terminal to prompt on; if credentials are missing it returns an
+error telling you to run `granola auth login`.
+
+### Tools
+
+| Tool | Returns |
+|---|---|
+| `granola_list_meetings` | Meetings newest-first, filterable by date range or title substring |
+| `granola_get_notes` | AI-enhanced notes for one meeting, as markdown |
+| `granola_get_transcript` | Full transcript for one meeting |
+| `granola_get_meeting_context` | Compact context: calendar window, attendees, per-channel attribution |
+
+`granola_list_meetings` accepts `since` / `until` (ISO date, RFC3339, `today`,
+`yesterday`, or a relative span like `7d`), `date` for a single day, `search`,
+`limit`, and `response_format` (`json` or `markdown`). The rest take a
+`meeting_id` — a full ID or any unique prefix.
+
+### Client setup
+
+Most clients take a command and args. For Claude Desktop
+(`claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "granola": {
+      "command": "/opt/homebrew/bin/granola",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+Use an **absolute path** to the binary. GUI clients spawn servers with a minimal
+`PATH` that usually excludes Homebrew's bin directory, so a bare `granola` will
+not resolve. `which granola` tells you the path to use.
+
+For Claude Code, `claude mcp add granola -- /opt/homebrew/bin/granola mcp`.
+
+---
+
 ## Claude Code plugin
 
 The repo's `.claude-plugin/marketplace.json` makes this a Claude Code plugin
@@ -157,10 +215,15 @@ tap workflow.
 
 ## Related
 
-**[granola-mcp](https://github.com/tmcinerney/granola-mcp)** — MCP server that wraps this CLI
-and exposes Granola meetings, notes, and transcripts as tools to Claude Code and Claude Desktop.
-Use this if you want Claude to query your Granola data directly via the Model Context Protocol,
-rather than through the CLI plugin skills above.
+**[granola-mcp](https://github.com/tmcinerney/granola-mcp)** — *deprecated.* A
+Python MCP server that wrapped this CLI as a subprocess. Its four tools now ship
+in this binary as `granola mcp` (see [MCP server](#mcp-server)), which removes
+the Python runtime, the subprocess hop, and the version-compatibility contract
+between the two packages.
+
+Tool names are unchanged. Arguments are flatter: the Python server wrapped them
+in a required `params` object, so `{"params": {"limit": 5}}` becomes
+`{"limit": 5}`.
 
 ---
 
