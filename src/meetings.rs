@@ -214,6 +214,36 @@ pub(crate) fn notes_document(document: &Value) -> Value {
         .unwrap_or(Value::Null)
 }
 
+/// Compact per-meeting summary for list responses.
+///
+/// AIDEV-NOTE: a raw Granola document carries ~47 fields. The largest is
+/// `ydoc_state` (a CRDT blob, meaningless to a caller), then `people` (which
+/// includes attendee emails) and `notes`/`notes_markdown`. Returning those from
+/// a *list* call cost ~6.5k characters per meeting — so a default limit of 50
+/// produced ~600k of mostly-noise, and leaked note content and emails for
+/// meetings the caller never asked to read. Detail belongs in the per-meeting
+/// tools instead. Keep this projection additive: widen it only with fields that
+/// help a caller *choose* a meeting.
+pub(crate) fn meeting_summary(m: &Value) -> Value {
+    let attendees: Vec<&str> = m
+        .pointer("/people/attendees")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(person_display_name).collect())
+        .unwrap_or_default();
+
+    serde_json::json!({
+        "id": m.get("id"),
+        "title": m.get("title"),
+        "created_at": m.get("created_at"),
+        "updated_at": m.get("updated_at"),
+        "start": m.pointer("/google_calendar_event/start/dateTime"),
+        "end": m.pointer("/google_calendar_event/end/dateTime"),
+        "platform": m.pointer("/people/conferencing/type"),
+        "attendee_names": attendees,
+        "origin": m.get("_origin"),
+    })
+}
+
 /// Notes rendered as markdown, falling back to Granola's flat `notes_markdown`
 /// field when the ProseMirror document is absent or renders empty.
 pub(crate) fn notes_markdown(document: &Value) -> String {
@@ -374,7 +404,7 @@ pub(crate) fn meeting_context_value(document: Value, transcript: Value) -> Resul
 mod tests {
     use super::{
         attribution_summary, format_transcript_segment, in_date_range, meeting_context_value,
-        resolve_meeting_id_from_documents,
+        meeting_summary, resolve_meeting_id_from_documents,
     };
     use chrono::{DateTime, Utc};
     use serde_json::json;
@@ -598,6 +628,65 @@ mod tests {
             .pointer("/document/unrecognized_document_field")
             .is_none());
         assert!(context.pointer("/transcript/0").is_none());
+    }
+
+    #[test]
+    fn meeting_summary_omits_bulk_and_sensitive_fields() {
+        let doc = json!({
+            "id": "aaaaaaaa-1111-4111-8111-111111111111",
+            "title": "Rae / Sam",
+            "created_at": "2026-07-22T17:00:00Z",
+            "updated_at": "2026-07-22T18:00:00Z",
+            "_origin": "owned",
+            // Bulk and sensitive fields that must not reach a list response.
+            "ydoc_state": "AAAAAAAAAAAAAAAA",
+            "notes": { "type": "doc", "content": [] },
+            "notes_markdown": "secret decisions",
+            "people": {
+                "conferencing": { "type": "zoom" },
+                "attendees": [
+                    { "email": "rae@example.com",
+                      "details": { "person": { "name": { "fullName": "Rae" } } } }
+                ]
+            },
+            "google_calendar_event": {
+                "start": { "dateTime": "2026-07-22T17:00:00Z" },
+                "end": { "dateTime": "2026-07-22T17:30:00Z" }
+            }
+        });
+
+        let summary = meeting_summary(&doc);
+
+        assert_eq!(summary["title"], json!("Rae / Sam"));
+        assert_eq!(summary["platform"], json!("zoom"));
+        assert_eq!(summary["start"], json!("2026-07-22T17:00:00Z"));
+        assert_eq!(summary["end"], json!("2026-07-22T17:30:00Z"));
+        assert_eq!(summary["attendee_names"], json!(["Rae"]));
+        assert_eq!(summary["origin"], json!("owned"));
+
+        // Bulk noise and note content stay out.
+        for absent in ["ydoc_state", "notes", "notes_markdown", "people"] {
+            assert!(
+                summary.get(absent).is_none(),
+                "`{absent}` must not appear in a list summary"
+            );
+        }
+        // Attendee emails must not leak, in any field.
+        assert!(
+            !serde_json::to_string(&summary)
+                .unwrap()
+                .contains("@example.com"),
+            "attendee emails must not appear in a list summary"
+        );
+    }
+
+    #[test]
+    fn meeting_summary_tolerates_a_sparse_document() {
+        let summary = meeting_summary(&json!({ "id": "x" }));
+        assert_eq!(summary["id"], json!("x"));
+        assert_eq!(summary["attendee_names"], json!([]));
+        assert!(summary["platform"].is_null());
+        assert!(summary["start"].is_null());
     }
 
     #[test]

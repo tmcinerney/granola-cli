@@ -141,6 +141,17 @@ Arguments are passed flat, and unrecognised ones are rejected rather than
 ignored, so a typo fails loudly instead of silently returning an unfiltered
 list. The tool schemas advertise this as `additionalProperties: false`.
 
+`granola_list_meetings` returns a compact summary per meeting — id, title,
+timestamps, calendar window, platform, attendee names — not the full Granola
+document. A raw document carries ~47 fields, mostly bulk (`ydoc_state`) or
+detail that belongs in a per-meeting call, so listing 50 of them cost ~600k
+characters. Use `granola_get_notes` or `granola_get_meeting_context` for detail
+on a specific meeting.
+
+In JSON the response is `{ total_matched, offset, count, meetings }`. Page with
+`offset` — MCP has no cursor pagination for tool results, so `total_matched` is
+how you tell "that's everything" from "there's more".
+
 ### Client setup
 
 Most clients take a command and args. For Claude Desktop
