@@ -82,6 +82,10 @@ pub struct ListMeetingsArgs {
     /// Maximum number of meetings to return (1-200).
     #[serde(default = "default_limit")]
     pub limit: u32,
+    /// Skip this many matching meetings before returning `limit`. Use with the
+    /// `total_matched` in the response to page through a long result set.
+    #[serde(default)]
+    pub offset: u32,
     /// Output format.
     #[serde(default)]
     pub response_format: ResponseFormat,
@@ -275,7 +279,13 @@ impl GranolaServer {
                         .map_err(|e| api::Error::Transport(e.to_string()))
                 })?;
 
-                let filtered: Vec<Value> = meetings
+                // AIDEV-NOTE: matched is collected before limit/offset so the
+                // response can report a total. Without it a caller cannot tell
+                // "that is everything" from "there is more", which is the only
+                // thing that makes `offset` usable — MCP has no cursor
+                // pagination for tool *results*, so paging has to be explicit
+                // in the payload.
+                let matched: Vec<Value> = meetings
                     .into_iter()
                     .filter(|m| meetings::in_date_range(m, created_since, created_until))
                     .filter(|m| {
@@ -289,13 +299,38 @@ impl GranolaServer {
                             .unwrap_or(false),
                         None => true,
                     })
+                    .collect();
+                let total_matched = matched.len();
+                let filtered: Vec<&Value> = matched
+                    .iter()
+                    .skip(args.offset as usize)
                     .take(limit as usize)
                     .collect();
 
                 Ok(match args.response_format {
-                    ResponseFormat::Json => serde_json::to_string_pretty(&filtered)?,
+                    ResponseFormat::Json => {
+                        let summaries: Vec<Value> = filtered
+                            .iter()
+                            .map(|m| meetings::meeting_summary(m))
+                            .collect();
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "total_matched": total_matched,
+                            "offset": args.offset,
+                            "count": summaries.len(),
+                            "meetings": summaries,
+                        }))?
+                    }
                     ResponseFormat::Markdown => {
-                        let mut out = format!("# Meetings ({} found)\n", filtered.len());
+                        let mut out = if total_matched > filtered.len() {
+                            format!(
+                                "# Meetings ({}-{} of {})\n",
+                                args.offset as usize + 1,
+                                args.offset as usize + filtered.len(),
+                                total_matched
+                            )
+                        } else {
+                            format!("# Meetings ({} found)\n", filtered.len())
+                        };
                         for m in &filtered {
                             out.push('\n');
                             out.push_str(&meeting_markdown(m));
