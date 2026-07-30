@@ -48,6 +48,14 @@ impl Display for Format {
     }
 }
 
+// AIDEV-NOTE: serde_yaml is deprecated upstream — its last release is literally
+// 0.9.34+deprecated (March 2024) — and we are staying on it deliberately. Do not
+// "fix" this by swapping in a fork. Checked 2026-07-30: serde_yaml_ng last
+// shipped May 2024 and serde_norway December 2024, so both are as stale as what
+// they would replace with a fraction of the usage, and serde_yml is actively
+// published but still 0.0.x. None of the four carries a RustSec advisory, and
+// this is one call behind `--output yaml`. Revisit only if an advisory lands or
+// a fork gains real maintenance.
 /// Emit a value in the requested format.
 pub fn emit<T: Serialize>(value: &T, format: Format) {
     let json_value = serde_json::to_value(value).unwrap_or(Value::Null);
