@@ -1,6 +1,6 @@
 [package]
 name = "granola-cli"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 # AIDEV-NOTE: raised from 1.74 by rmcp 3, which is edition 2024 and declares
 # rust-version 1.88 (as do its darling/rmcp-macros deps). CI only builds on
