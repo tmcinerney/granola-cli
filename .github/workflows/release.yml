@@ -10,10 +10,23 @@ on:
 permissions:
   contents: write
 
+# Serialise runs per tag, but never cancel: a cancelled release can leave a
+# partially-uploaded draft behind. v0.5.4 had to be deleted by hand for exactly
+# this reason.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # Match CI, so a release build cannot pass with warnings CI would reject.
+  RUSTFLAGS: -D warnings
+
 jobs:
   build:
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -37,10 +50,32 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # AIDEV-NOTE: nothing else ties the tag to the crate version. Tagging
+      # v0.6.0 with Cargo.toml still at 0.5.5 would produce assets named
+      # granola-v0.6.0-* containing a binary that reports 0.5.5 — the Homebrew
+      # formula's version assertion would catch it, but only after the tap was
+      # updated. Fail here instead, before anything is built.
+      - name: Tag must match Cargo.toml
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME#v}"
+          CRATE=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "$TAG" != "$CRATE" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${CRATE}"
+            exit 1
+          fi
+          echo "tag ${GITHUB_REF_NAME} matches Cargo.toml ${CRATE}"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
 
       - name: Install musl tools
         if: matrix.target == 'x86_64-unknown-linux-musl'
@@ -189,6 +224,72 @@ jobs:
             granola-*.tar.gz.sha256
             granola-*.zip
             granola-*.zip.sha256
+          # Each matrix job only produces one archive type, so its glob for the
+          # other necessarily matches nothing. The completeness guarantee comes
+          # from the verify job below, not from this flag.
           fail_on_unmatched_files: false
-          draft: false
+          # AIDEV-NOTE: draft until every asset is confirmed present. v0.5.3
+          # published with 3 of 5 targets and looked successful, because
+          # fail-fast is false and each job uploads independently. A draft is
+          # invisible and undownloadable, so an incomplete release cannot be
+          # consumed; the verify job promotes it only when it is whole.
+          draft: true
           prerelease: false
+
+  verify:
+    name: verify and publish
+    needs: build
+    # Runs even when a build job fails, so an incomplete draft is reported
+    # rather than silently left behind.
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Every expected asset must be present, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # AIDEV-NOTE: keep in step with the build matrix above.
+          TARGETS=(
+            "aarch64-apple-darwin:tar.gz"
+            "x86_64-apple-darwin:tar.gz"
+            "x86_64-unknown-linux-gnu:tar.gz"
+            "x86_64-unknown-linux-musl:tar.gz"
+            "x86_64-pc-windows-msvc:zip"
+          )
+
+          present=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --json assets -q '.assets[].name' | sort)
+          echo "published assets:"
+          echo "$present"
+
+          missing=()
+          for spec in "${TARGETS[@]}"; do
+            target="${spec%%:*}"
+            archive="${spec##*:}"
+            for name in \
+              "granola-${GITHUB_REF_NAME}-${target}.${archive}" \
+              "granola-${GITHUB_REF_NAME}-${target}.${archive}.sha256"; do
+              if ! grep -qxF "$name" <<<"$present"; then
+                missing+=("$name")
+              fi
+            done
+          done
+
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::release is incomplete; leaving it as a draft"
+            for name in "${missing[@]}"; do
+              echo "::error::missing $name"
+            done
+            exit 1
+          fi
+
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
+          echo "all $(( ${#TARGETS[@]} * 2 )) assets present; release published"

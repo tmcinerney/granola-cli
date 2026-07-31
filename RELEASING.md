@@ -45,7 +45,14 @@ git push origin v0.1.4
 ```
 
 The release workflow in `.github/workflows/release.yml` runs when a `v*` tag
-is pushed. The two macOS binaries are code-signed with a stable self-signed
+is pushed. It first checks the tag against the version in `Cargo.toml` and fails
+immediately if they disagree, so a mismatched tag never produces assets.
+
+The release is created as a **draft**. A final `verify` job checks that all ten
+assets are present and only then publishes it. A run where some targets fail
+therefore leaves an unpublished draft rather than a release that looks complete —
+which is what happened to v0.5.3, published with three of five targets before the
+check existed. The two macOS binaries are code-signed with a stable self-signed
 certificate before packaging, and the workflow **fails** if the resulting
 designated requirement is not certificate-based — `codesign` exits 0 even when
 it cannot find the identity, so an unverified step would silently ship unsigned
@@ -59,7 +66,8 @@ It uploads these assets:
 - `x86_64-unknown-linux-musl`
 - `x86_64-pc-windows-msvc`
 
-Watch the workflow until it finishes:
+Watch the workflow until it finishes. It is not done until the `verify` job
+has published the draft:
 
 ```sh
 gh run list --repo tmcinerney/granola-cli --workflow Release --limit 1
