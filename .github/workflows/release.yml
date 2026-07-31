@@ -1,5 +1,12 @@
 name: Release
 
+# AIDEV-NOTE: third-party actions are pinned to commit SHAs, not tags. A tag is
+# mutable, so `@v2` can be repointed at new code by whoever controls the repo.
+# That matters here because release.yml holds an Apple Developer ID signing key
+# and `contents: write` — a compromised action could sign and publish arbitrary
+# binaries under a trusted identity. The trailing comment records the human
+# version; Dependabot updates both together.
+
 # Tagging v* triggers a build matrix that uploads platform binaries
 # to the matching GitHub Release.
 
@@ -48,7 +55,7 @@ jobs:
             archive: zip
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # AIDEV-NOTE: nothing else ties the tag to the crate version. Tagging
       # v0.6.0 with Cargo.toml still at 0.5.5 would produce assets named
@@ -68,12 +75,12 @@ jobs:
           echo "tag ${GITHUB_REF_NAME} matches Cargo.toml ${CRATE}"
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: ${{ matrix.target }}
 
       - name: Cache cargo registry + build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
         with:
           key: release-${{ matrix.target }}
 
@@ -201,7 +208,7 @@ jobs:
           sha256sum "${STAGE}.zip" > "${STAGE}.zip.sha256"
 
       - name: Upload to release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           files: |
             granola-*.tar.gz
@@ -231,7 +238,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Every expected asset must be present, then publish
         env:
