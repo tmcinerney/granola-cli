@@ -140,60 +140,57 @@ git branch -d release/v0.1.4
 
 ## Code signing
 
-macOS release binaries are signed with a self-signed certificate stored in
-1Password (`granola-cli macOS code signing`, Dev Secrets, personal account) and
-mirrored to the repo secrets `MACOS_SIGNING_P12` (base64 `.p12`) and
+macOS release binaries are signed with an **Apple Developer ID Application**
+certificate (team `KMWQ959CHU`, personal Apple Developer Program account). The
+key is in 1Password as `granola-cli Apple Developer ID signing` (Dev Secrets) and
+mirrored to the repo secrets `MACOS_SIGNING_P12` and
 `MACOS_SIGNING_P12_PASSWORD`.
 
 ### Why
 
-An ad-hoc signature's designated requirement is the code hash:
+Not for Gatekeeper. Homebrew installs via `curl`, which never sets
+`com.apple.quarantine`, and Gatekeeper only evaluates quarantined files — so
+these binaries are not notarized and that is fine.
+
+It is for the **keychain**. A "always allow" grant is bound to a partition, and a
+signer without an Apple Team Identifier falls back to a per-build `cdhash:`
+partition — so every new version re-prompted for the login password on every
+keychain read. A Developer ID signature produces a stable `teamid:KMWQ959CHU`
+partition and a designated requirement pinned to the team OU:
+
+```text
+designated => identifier "com.tmcinerney.granola" and anchor apple generic
+  and certificate leaf[subject.OU] = KMWQ959CHU
+```
+
+rather than the ad-hoc form, which changes every build:
 
 ```text
 designated => cdhash H"f0fb14519cab7d8e1e487ba5e6459652f3bf3d42"
 ```
 
-That changes with every build, so the macOS keychain treats each release as a
-different application, an "always allow" grant never matches again, and users
-get a login-password prompt on every upgrade. Signing with a fixed certificate
-produces a stable requirement instead:
+Verified empirically: four never-granted builds signed this way read the
+credential silently, while a self-signed control prompted every time. **A
+self-signed certificate cannot substitute** — it has no team identifier, which is
+the deciding factor.
 
-```text
-designated => identifier "com.tmcinerney.granola" and certificate root = H"2af6bd95..."
-```
+### Renewal
 
-### What this is not
+The certificate expires **2027-02-01**. Because the requirement pins the team OU
+and not the certificate, reissuing under the same team keeps existing keychain
+grants working — no user-visible disruption.
 
-It is not an Apple Developer ID and the binaries are not notarized, so
-Gatekeeper rejects them. That does not affect Homebrew installs: `brew`
-downloads via curl, which never sets `com.apple.quarantine`, and Gatekeeper only
-evaluates quarantined files. Someone downloading a tarball from the Releases
-page in a browser *would* see a warning and need `xattr -d com.apple.quarantine`
-or right-click → Open.
+### Rotating or restoring the key
 
-### Why the certificate is committed
-
-`.github/signing-cert.pem` is the public certificate, checked in deliberately.
-The workflow needs it for `security add-trusted-cert`, and extracting it from the
-`.p12` is not possible in a way both toolchains accept: a bundle macOS can import
-uses legacy RC2-40-CBC, which OpenSSL 3 refuses; one OpenSSL 3 can read uses
-AES-256-CBC with a SHA-256 MAC, which makes `security import` fail MAC
-verification. A certificate is public, so committing it sidesteps the conflict
-and lets anyone verify which identity signs the releases. Only the `.p12` and its
-password are secret.
-
-### Rotating or restoring the certificate
-
-GitHub secrets are write-only, so the 1Password item is the only recoverable
-copy. If it is lost, future releases sign with a new certificate, the designated
-requirement changes, and every existing "always allow" grant breaks — permanently
-re-triggering the prompts. To restore:
+Apple allows a Developer ID private key to be downloaded once, so the 1Password
+item and the login keychain are the only copies. GitHub secrets are write-only.
 
 ```sh
-op read "op://Dev Secrets/granola-cli macOS code signing/p12_base64" \
+op read "op://Dev Secrets/granola-cli Apple Developer ID signing/p12_base64" \
   --account my.1password.com | gh secret set MACOS_SIGNING_P12 --repo tmcinerney/granola-cli
-op read "op://Dev Secrets/granola-cli macOS code signing/password" \
+op read "op://Dev Secrets/granola-cli Apple Developer ID signing/password" \
   --account my.1password.com | gh secret set MACOS_SIGNING_P12_PASSWORD --repo tmcinerney/granola-cli
 ```
 
-The certificate expires 2036-07-28.
+If the key is ever lost entirely, issue a new certificate under the same team —
+grants survive, because the requirement pins the OU.

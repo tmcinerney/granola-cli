@@ -84,38 +84,42 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
-      # AIDEV-NOTE: sign macOS binaries with a stable self-signed certificate.
+      # AIDEV-NOTE: sign macOS binaries with an Apple Developer ID certificate.
       #
-      # An ad-hoc signature's designated requirement is the cdhash, which changes
-      # with every build, so the macOS keychain treats each release as a
-      # different application and cannot keep an "always allow" grant — users get
-      # a login-password prompt on every upgrade. Signing with a fixed
-      # certificate makes the requirement identifier+certificate based, so the
-      # grant survives version bumps.
+      # The problem this solves is not Gatekeeper — Homebrew installs via curl,
+      # which never sets com.apple.quarantine, so Gatekeeper is never consulted.
+      # It is the macOS keychain. A grant ("always allow") is bound to a
+      # partition, and a signer without an Apple Team Identifier falls back to a
+      # per-build `cdhash:` partition — so every new version re-prompted for the
+      # login password. A Developer ID signature gives a stable
+      # `teamid:KMWQ959CHU` partition and a designated requirement pinned to the
+      # team OU rather than the code hash.
       #
-      # Deliberately NOT an Apple Developer ID: these binaries are not notarized
-      # and Gatekeeper rejects them. That is fine because Homebrew installs via
-      # curl, which never sets com.apple.quarantine, so Gatekeeper is not
-      # consulted. Only a browser download of the tarball would trip it.
+      # Verified empirically: four never-granted builds signed this way read the
+      # credential silently, while a self-signed control prompted every time.
+      # A self-signed certificate cannot fix this, because it has no team ID.
       #
-      # The cert lives in 1Password ("granola-cli macOS code signing", Dev
-      # Secrets). GitHub secrets are write-only, so that item is the only
-      # recoverable copy — losing it means future releases sign with a different
-      # certificate, permanently re-triggering the prompts.
+      # Because the requirement pins the team OU and not the certificate,
+      # renewing the cert (expires 2027-02-01) preserves existing grants.
+      #
+      # Key lives in 1Password: "granola-cli Apple Developer ID signing"
+      # (Dev Secrets, personal account). GitHub secrets are write-only, so that
+      # item is the only recoverable copy — Apple allows the private key to be
+      # downloaded once.
       - name: Sign (macOS)
         if: contains(matrix.target, 'apple-darwin')
-        # A hang here means something is waiting on an interactive prompt that
-        # cannot be answered; fail in minutes rather than burning the job.
+        # A hang here means something is waiting on a prompt that cannot be
+        # answered. Fail in minutes rather than burning the job.
         timeout-minutes: 5
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
           MACOS_SIGNING_P12: ${{ secrets.MACOS_SIGNING_P12 }}
           MACOS_SIGNING_P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}
+          SIGNING_IDENTITY: "Developer ID Application: Travers McInerney (KMWQ959CHU)"
         run: |
           set -euo pipefail
 
-          # Refuse to publish an unsigned macOS binary by accident.
           if [ -z "${MACOS_SIGNING_P12:-}" ] || [ -z "${MACOS_SIGNING_P12_PASSWORD:-}" ]; then
             echo "::error::signing secrets are missing; refusing to publish an unsigned macOS binary"
             exit 1
@@ -126,18 +130,7 @@ jobs:
           KEYCHAIN="$WORK/signing.keychain-db"
           trap 'security delete-keychain "$KEYCHAIN" 2>/dev/null || true; rm -rf "$WORK"' EXIT
 
-          # AIDEV-NOTE: the certificate is read from the repo, not extracted
-          # from the .p12, because the two toolchains disagree on PKCS#12
-          # algorithms and there is no format both accept. A p12 macOS can
-          # import uses legacy RC2-40-CBC, which OpenSSL 3 refuses without the
-          # legacy provider; one written with AES-256-CBC and a SHA-256 MAC is
-          # readable by OpenSSL 3 but makes `security import` fail with "MAC
-          # verification failed". Since a certificate is public there is no
-          # reason to derive it from the encrypted bundle at all — this removes
-          # the conflict instead of negotiating it, and makes the signing
-          # identity auditable from the repo.
           printf '%s' "$MACOS_SIGNING_P12" | base64 -d > "$WORK/cert.p12"
-          cp .github/signing-cert.pem "$WORK/cert.pem"
 
           security create-keychain -p "$MACOS_SIGNING_P12_PASSWORD" "$KEYCHAIN"
           security unlock-keychain -p "$MACOS_SIGNING_P12_PASSWORD" "$KEYCHAIN"
@@ -146,39 +139,31 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: \
             -s -k "$MACOS_SIGNING_P12_PASSWORD" "$KEYCHAIN" >/dev/null
 
-          # codesign refuses an untrusted identity outright, reporting
-          # "no identity found" — while still exiting 0. Trust is required.
-          #
-          # AIDEV-NOTE: must be the admin domain (-d, System.keychain) via sudo.
-          # The user-domain form works interactively but blocks forever on a
-          # headless runner waiting for an authorization dialog that can never
-          # appear — v0.5.4 hung here for 29 minutes before being cancelled.
-          # GitHub-hosted runners have passwordless sudo, so the admin domain
-          # writes without prompting.
-          sudo security add-trusted-cert -d -r trustRoot -p codeSign \
-            -k /Library/Keychains/System.keychain "$WORK/cert.pem"
+          # AIDEV-NOTE: no add-trusted-cert step. A Developer ID certificate
+          # chains to Apple's root, which is already trusted everywhere. The
+          # self-signed predecessor needed an explicit trust write, and the
+          # user-domain form of that blocked forever on a headless runner —
+          # v0.5.4 hung for 29 minutes before being cancelled.
 
           # codesign only searches keychains on the search list.
           ORIGINAL=$(security list-keychains -d user | tr -d ' "')
-          # $ORIGINAL is a whitespace-separated list of keychain paths and must
-          # word-split into separate arguments here.
           # shellcheck disable=SC2086
           security list-keychains -d user -s "$KEYCHAIN" $ORIGINAL
 
-          codesign --force --timestamp=none \
-            -s "granola-cli code signing" -i com.tmcinerney.granola "$BIN"
+          codesign --force --timestamp \
+            -s "$SIGNING_IDENTITY" -i com.tmcinerney.granola "$BIN"
 
           # shellcheck disable=SC2086
           security list-keychains -d user -s $ORIGINAL
 
-          # AIDEV-NOTE: this check is load-bearing. codesign exits 0 when it
-          # cannot find the identity, so exit status alone would happily ship an
-          # unsigned binary and the only symptom would be users' password
-          # prompts coming back. Assert the requirement actually changed shape.
+          # AIDEV-NOTE: load-bearing. codesign exits 0 when it cannot find the
+          # identity — it prints "no identity found" and leaves the binary
+          # untouched — so exit status alone would ship unsigned binaries whose
+          # only symptom is the password prompts returning.
           REQ=$(codesign -d --requirements - "$BIN" 2>&1 || true)
           echo "$REQ"
-          if ! grep -q 'certificate root' <<<"$REQ"; then
-            echo "::error::designated requirement is not certificate-based; the binary is not properly signed"
+          if ! grep -q 'subject.OU. = KMWQ959CHU' <<<"$REQ"; then
+            echo "::error::designated requirement is not pinned to the signing team; binary is not properly signed"
             exit 1
           fi
           if grep -q 'cdhash' <<<"$REQ"; then
@@ -186,7 +171,6 @@ jobs:
             exit 1
           fi
           codesign --verify --strict --verbose=2 "$BIN"
-          echo "signed: $REQ"
 
       - name: Package (unix)
         if: matrix.archive == 'tar.gz'
