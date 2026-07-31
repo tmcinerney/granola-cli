@@ -45,7 +45,13 @@ git push origin v0.1.4
 ```
 
 The release workflow in `.github/workflows/release.yml` runs when a `v*` tag
-is pushed. It uploads these assets:
+is pushed. The two macOS binaries are code-signed with a stable self-signed
+certificate before packaging, and the workflow **fails** if the resulting
+designated requirement is not certificate-based — `codesign` exits 0 even when
+it cannot find the identity, so an unverified step would silently ship unsigned
+binaries. See [Code signing](#code-signing) below.
+
+It uploads these assets:
 
 - `aarch64-apple-darwin`
 - `x86_64-apple-darwin`
@@ -123,3 +129,52 @@ cd path/to/granola-cli
 git worktree remove .worktrees/release-v0.1.4
 git branch -d release/v0.1.4
 ```
+
+## Code signing
+
+macOS release binaries are signed with a self-signed certificate stored in
+1Password (`granola-cli macOS code signing`, Dev Secrets, personal account) and
+mirrored to the repo secrets `MACOS_SIGNING_P12` (base64 `.p12`) and
+`MACOS_SIGNING_P12_PASSWORD`.
+
+### Why
+
+An ad-hoc signature's designated requirement is the code hash:
+
+```text
+designated => cdhash H"f0fb14519cab7d8e1e487ba5e6459652f3bf3d42"
+```
+
+That changes with every build, so the macOS keychain treats each release as a
+different application, an "always allow" grant never matches again, and users
+get a login-password prompt on every upgrade. Signing with a fixed certificate
+produces a stable requirement instead:
+
+```text
+designated => identifier "com.tmcinerney.granola" and certificate root = H"2af6bd95..."
+```
+
+### What this is not
+
+It is not an Apple Developer ID and the binaries are not notarized, so
+Gatekeeper rejects them. That does not affect Homebrew installs: `brew`
+downloads via curl, which never sets `com.apple.quarantine`, and Gatekeeper only
+evaluates quarantined files. Someone downloading a tarball from the Releases
+page in a browser *would* see a warning and need `xattr -d com.apple.quarantine`
+or right-click → Open.
+
+### Rotating or restoring the certificate
+
+GitHub secrets are write-only, so the 1Password item is the only recoverable
+copy. If it is lost, future releases sign with a new certificate, the designated
+requirement changes, and every existing "always allow" grant breaks — permanently
+re-triggering the prompts. To restore:
+
+```sh
+op read "op://Dev Secrets/granola-cli macOS code signing/p12_base64" \
+  --account my.1password.com | gh secret set MACOS_SIGNING_P12 --repo tmcinerney/granola-cli
+op read "op://Dev Secrets/granola-cli macOS code signing/password" \
+  --account my.1password.com | gh secret set MACOS_SIGNING_P12_PASSWORD --repo tmcinerney/granola-cli
+```
+
+The certificate expires 2036-07-28.
