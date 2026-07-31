@@ -69,6 +69,9 @@ jobs:
       # certificate, permanently re-triggering the prompts.
       - name: Sign (macOS)
         if: contains(matrix.target, 'apple-darwin')
+        # A hang here means something is waiting on an interactive prompt that
+        # cannot be answered; fail in minutes rather than burning the job.
+        timeout-minutes: 5
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
@@ -110,7 +113,15 @@ jobs:
 
           # codesign refuses an untrusted identity outright, reporting
           # "no identity found" — while still exiting 0. Trust is required.
-          security add-trusted-cert -r trustRoot -p codeSign -k "$KEYCHAIN" "$WORK/cert.pem"
+          #
+          # AIDEV-NOTE: must be the admin domain (-d, System.keychain) via sudo.
+          # The user-domain form works interactively but blocks forever on a
+          # headless runner waiting for an authorization dialog that can never
+          # appear — v0.5.4 hung here for 29 minutes before being cancelled.
+          # GitHub-hosted runners have passwordless sudo, so the admin domain
+          # writes without prompting.
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign \
+            -k /Library/Keychains/System.keychain "$WORK/cert.pem"
 
           # codesign only searches keychains on the search list.
           ORIGINAL=$(security list-keychains -d user | tr -d ' "')
