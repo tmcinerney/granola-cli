@@ -166,7 +166,10 @@ humans only.
 
 Arguments are passed flat, and unrecognised ones are rejected rather than
 ignored, so a typo fails loudly instead of silently returning an unfiltered
-list. The tool schemas advertise this as `additionalProperties: false`.
+list. Keys beginning with `_` are the exception: MCP reserves `_meta`, and a
+leading underscore can't collide with a real argument, so those pass through and
+are ignored. The tool schemas advertise exactly this — `additionalProperties:
+false` with `patternProperties: {"^_": {}}`.
 
 `granola_list_meetings` returns a compact summary per meeting — id, title,
 timestamps, calendar window, platform, attendee names — not the full Granola

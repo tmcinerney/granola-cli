@@ -50,14 +50,93 @@ pub enum ResponseFormat {
     Markdown,
 }
 
-// AIDEV-NOTE: deny_unknown_fields is load-bearing for an agent-facing API, and
-// restores parity with the retired Python server's `extra="forbid"`. Without it
-// serde silently ignores unrecognised keys, so a typo'd or wrongly-nested
-// argument object deserialises to all-defaults — an unfiltered list of 50 full
-// documents — instead of erroring. That reads to the caller as a working tool
-// returning the wrong thing, which is far worse than a rejected call.
+/// Absorbs MCP's reserved `_`-prefixed keys so they do not read as typos.
+///
+/// AIDEV-NOTE: replaces `#[serde(deny_unknown_fields)]`, which serde cannot
+/// combine with a flattened catch-all. Rejection still happens during
+/// deserialization — this type errors on any leftover key *not* starting with
+/// `_` — so the guard cannot be forgotten at a call site.
+///
+/// Why underscore keys are exempt: MCP reserves `_meta` on requests, and a
+/// leading underscore is a reserved-prefix convention, so such a key can never
+/// collide with a real argument. A client that puts `_meta` inside `arguments`
+/// (the spec puts it a level up) would otherwise get a rejection it cannot act
+/// on — the same unactionable-failure class this validation exists to remove.
+/// Values are discarded; nothing reserved is interpreted.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct ReservedArgs;
+
+impl<'de> Deserialize<'de> for ReservedArgs {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Sink;
+
+        impl<'de> serde::de::Visitor<'de> for Sink {
+            type Value = ReservedArgs;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("no unrecognised arguments")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<ReservedArgs, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut unknown: Vec<String> = Vec::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                    if !key.starts_with('_') {
+                        unknown.push(key);
+                    }
+                }
+                if !unknown.is_empty() {
+                    unknown.sort();
+                    let list = unknown
+                        .iter()
+                        .map(|k| format!("`{k}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(serde::de::Error::custom(format!(
+                        "unknown field{}: {list}. Arguments are passed flat, not wrapped \
+                         in a `params` object; see the tool's inputSchema.",
+                        if unknown.len() == 1 { "" } else { "s" }
+                    )));
+                }
+                Ok(ReservedArgs)
+            }
+        }
+
+        deserializer.deserialize_map(Sink)
+    }
+}
+
+// Contributes no properties of its own, so a flattened field leaves the parent
+// schema's declared arguments untouched.
+impl JsonSchema for ReservedArgs {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ReservedArgs".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({ "type": "object" })
+    }
+}
+
+// AIDEV-NOTE: rejecting unrecognised arguments is load-bearing for an
+// agent-facing API, and restores parity with the retired Python server's
+// `extra="forbid"`. Serde ignores unknown keys by default, so a typo'd or
+// wrongly-nested argument object would deserialise to all-defaults — an
+// unfiltered list of 50 full documents — instead of erroring. That reads to the
+// caller as a working tool returning the wrong thing, far worse than a rejected
+// call. Enforced by the flattened ReservedArgs below, which also lets MCP's
+// reserved `_`-prefixed keys through.
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[schemars(extend(
+    "additionalProperties" = false,
+    "patternProperties" = serde_json::json!({ "^_": {} })
+))]
 pub struct ListMeetingsArgs {
     /// Meetings on a single day. ISO `YYYY-MM-DD`. Shorthand for setting
     /// `since` to that day and `until` to the next.
@@ -100,13 +179,21 @@ pub struct ListMeetingsArgs {
     /// Include meetings shared with you as well as ones you own.
     #[serde(default = "default_include_shared")]
     pub include_shared: bool,
+    // Never read: its Deserialize impl does the validating, and reserved values
+    // are deliberately discarded. Present so serde routes leftover keys here.
+    #[allow(dead_code)]
+    #[serde(flatten)]
+    pub reserved: ReservedArgs,
 }
 
 // AIDEV-NOTE: notes default to markdown rather than json because they are prose
 // and the labelled headings are the readable form; the other tools default to
 // json. Both remain available on either.
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[schemars(extend(
+    "additionalProperties" = false,
+    "patternProperties" = serde_json::json!({ "^_": {} })
+))]
 pub struct NotesArgs {
     /// Granola meeting ID from `granola_list_meetings`. A unique ID prefix also
     /// resolves.
@@ -114,6 +201,11 @@ pub struct NotesArgs {
     /// Output format.
     #[serde(default = "markdown_format")]
     pub response_format: ResponseFormat,
+    // Never read: its Deserialize impl does the validating, and reserved values
+    // are deliberately discarded. Present so serde routes leftover keys here.
+    #[allow(dead_code)]
+    #[serde(flatten)]
+    pub reserved: ReservedArgs,
 }
 
 fn markdown_format() -> ResponseFormat {
@@ -121,7 +213,10 @@ fn markdown_format() -> ResponseFormat {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[schemars(extend(
+    "additionalProperties" = false,
+    "patternProperties" = serde_json::json!({ "^_": {} })
+))]
 pub struct MeetingIdFormatArgs {
     /// Granola meeting ID from `granola_list_meetings`. A unique ID prefix also
     /// resolves.
@@ -129,6 +224,11 @@ pub struct MeetingIdFormatArgs {
     /// Output format.
     #[serde(default)]
     pub response_format: ResponseFormat,
+    // Never read: its Deserialize impl does the validating, and reserved values
+    // are deliberately discarded. Present so serde routes leftover keys here.
+    #[allow(dead_code)]
+    #[serde(flatten)]
+    pub reserved: ReservedArgs,
 }
 
 #[derive(Clone)]
@@ -526,6 +626,42 @@ pub fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{ListMeetingsArgs, NotesArgs, ResponseFormat};
+
+    /// MCP reserves `_meta`, and a leading underscore cannot collide with a real
+    /// argument — so reserved keys pass through and are ignored, while anything
+    /// that could be a mistyped parameter is still rejected.
+    #[test]
+    fn reserved_underscore_keys_are_accepted_and_ignored() {
+        let args: ListMeetingsArgs =
+            serde_json::from_str(r#"{"limit":2,"_meta":{"progressToken":1}}"#)
+                .expect("_meta must not be treated as a typo");
+        assert_eq!(args.limit, 2);
+
+        // Any underscore-prefixed key, not just _meta — the prefix is the rule.
+        assert!(serde_json::from_str::<ListMeetingsArgs>(r#"{"_futureThing":"x"}"#).is_ok());
+        // And on the other argument types too.
+        assert!(serde_json::from_str::<NotesArgs>(r#"{"meeting_id":"a","_meta":{}}"#).is_ok());
+    }
+
+    /// The exemption is a *prefix* rule, so a trailing or interior underscore is
+    /// still a typo and must not slip through.
+    #[test]
+    fn only_a_leading_underscore_is_exempt() {
+        for bad in [r#"{"limit_":2}"#, r#"{"my_limit":2}"#, r#"{"limitt":2}"#] {
+            assert!(
+                serde_json::from_str::<ListMeetingsArgs>(bad).is_err(),
+                "should reject: {bad}"
+            );
+        }
+    }
+
+    /// A reserved key must not disable validation for the rest of the object.
+    #[test]
+    fn reserved_keys_do_not_weaken_the_rest_of_the_check() {
+        let err = serde_json::from_str::<ListMeetingsArgs>(r#"{"_meta":{},"params":{"limit":2}}"#)
+            .expect_err("`params` is still unknown even alongside _meta");
+        assert!(err.to_string().contains("params"), "unexpected: {err}");
+    }
 
     /// Regression: unknown arguments must be rejected, not silently ignored.
     ///
