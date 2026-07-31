@@ -49,6 +49,90 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
+      # AIDEV-NOTE: sign macOS binaries with a stable self-signed certificate.
+      #
+      # An ad-hoc signature's designated requirement is the cdhash, which changes
+      # with every build, so the macOS keychain treats each release as a
+      # different application and cannot keep an "always allow" grant — users get
+      # a login-password prompt on every upgrade. Signing with a fixed
+      # certificate makes the requirement identifier+certificate based, so the
+      # grant survives version bumps.
+      #
+      # Deliberately NOT an Apple Developer ID: these binaries are not notarized
+      # and Gatekeeper rejects them. That is fine because Homebrew installs via
+      # curl, which never sets com.apple.quarantine, so Gatekeeper is not
+      # consulted. Only a browser download of the tarball would trip it.
+      #
+      # The cert lives in 1Password ("granola-cli macOS code signing", Dev
+      # Secrets). GitHub secrets are write-only, so that item is the only
+      # recoverable copy — losing it means future releases sign with a different
+      # certificate, permanently re-triggering the prompts.
+      - name: Sign (macOS)
+        if: contains(matrix.target, 'apple-darwin')
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          MACOS_SIGNING_P12: ${{ secrets.MACOS_SIGNING_P12 }}
+          MACOS_SIGNING_P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          # Refuse to publish an unsigned macOS binary by accident.
+          if [ -z "${MACOS_SIGNING_P12:-}" ] || [ -z "${MACOS_SIGNING_P12_PASSWORD:-}" ]; then
+            echo "::error::signing secrets are missing; refusing to publish an unsigned macOS binary"
+            exit 1
+          fi
+
+          BIN="target/${TARGET}/release/granola"
+          WORK=$(mktemp -d)
+          KEYCHAIN="$WORK/signing.keychain-db"
+          trap 'security delete-keychain "$KEYCHAIN" 2>/dev/null || true; rm -rf "$WORK"' EXIT
+
+          printf '%s' "$MACOS_SIGNING_P12" | base64 -d > "$WORK/cert.p12"
+          openssl pkcs12 -in "$WORK/cert.p12" -nokeys \
+            -passin "pass:$MACOS_SIGNING_P12_PASSWORD" -out "$WORK/cert.pem"
+
+          security create-keychain -p "$MACOS_SIGNING_P12_PASSWORD" "$KEYCHAIN"
+          security unlock-keychain -p "$MACOS_SIGNING_P12_PASSWORD" "$KEYCHAIN"
+          security import "$WORK/cert.p12" -k "$KEYCHAIN" \
+            -P "$MACOS_SIGNING_P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$MACOS_SIGNING_P12_PASSWORD" "$KEYCHAIN" >/dev/null
+
+          # codesign refuses an untrusted identity outright, reporting
+          # "no identity found" — while still exiting 0. Trust is required.
+          security add-trusted-cert -r trustRoot -p codeSign -k "$KEYCHAIN" "$WORK/cert.pem"
+
+          # codesign only searches keychains on the search list.
+          ORIGINAL=$(security list-keychains -d user | tr -d ' "')
+          # $ORIGINAL is a whitespace-separated list of keychain paths and must
+          # word-split into separate arguments here.
+          # shellcheck disable=SC2086
+          security list-keychains -d user -s "$KEYCHAIN" $ORIGINAL
+
+          codesign --force --timestamp=none \
+            -s "granola-cli code signing" -i com.tmcinerney.granola "$BIN"
+
+          # shellcheck disable=SC2086
+          security list-keychains -d user -s $ORIGINAL
+
+          # AIDEV-NOTE: this check is load-bearing. codesign exits 0 when it
+          # cannot find the identity, so exit status alone would happily ship an
+          # unsigned binary and the only symptom would be users' password
+          # prompts coming back. Assert the requirement actually changed shape.
+          REQ=$(codesign -d --requirements - "$BIN" 2>&1 || true)
+          echo "$REQ"
+          if ! grep -q 'certificate root' <<<"$REQ"; then
+            echo "::error::designated requirement is not certificate-based; the binary is not properly signed"
+            exit 1
+          fi
+          if grep -q 'cdhash' <<<"$REQ"; then
+            echo "::error::designated requirement still pins the cdhash; signing did not take effect"
+            exit 1
+          fi
+          codesign --verify --strict --verbose=2 "$BIN"
+          echo "signed: $REQ"
+
       - name: Package (unix)
         if: matrix.archive == 'tar.gz'
         shell: bash
