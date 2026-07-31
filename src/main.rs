@@ -195,6 +195,8 @@ fn run_auth(cmd: &AuthCmd) -> Result<()> {
 }
 
 fn auth_login(opts: &OutputOpts) -> Result<()> {
+    // Any client cached from the previous credentials is now stale.
+    api::clear_cached_client();
     match auth::load_credentials_from_file() {
         Ok(c) => auth::save_credentials(&c)?,
         #[cfg(target_os = "macos")]
@@ -270,6 +272,7 @@ fn auth_status(opts: &OutputOpts) -> Result<()> {
 }
 
 fn auth_logout(opts: &OutputOpts) -> Result<()> {
+    api::clear_cached_client();
     auth::delete_credentials()?;
     emit_message(opts, "ok", "Logged out")
 }

@@ -117,7 +117,14 @@ granola mcp
 ```
 
 It speaks JSON-RPC over stdin/stdout, so it is meant to be spawned by an MCP
-client rather than run by hand. Authentication is shared with the CLI — run
+client rather than run by hand. Credentials are read from the keychain once per
+process and reused, so a long session does not re-read them per tool call.
+
+On macOS you may be prompted for your login password the first time a *new*
+version runs. The release binaries are ad-hoc signed, and their code identity
+changes with every build, so the keychain treats each version as a different
+application and cannot keep an "always allow" grant across upgrades. One prompt
+per version per process is expected; a prompt on every tool call is not. Authentication is shared with the CLI — run
 `granola auth login` once in a terminal and the server uses the same keychain
 credentials, refreshing them automatically. It never prompts for login itself,
 since it has no terminal to prompt on; if credentials are missing it returns an
