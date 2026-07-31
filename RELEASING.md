@@ -163,6 +163,17 @@ evaluates quarantined files. Someone downloading a tarball from the Releases
 page in a browser *would* see a warning and need `xattr -d com.apple.quarantine`
 or right-click → Open.
 
+### Why the certificate is committed
+
+`.github/signing-cert.pem` is the public certificate, checked in deliberately.
+The workflow needs it for `security add-trusted-cert`, and extracting it from the
+`.p12` is not possible in a way both toolchains accept: a bundle macOS can import
+uses legacy RC2-40-CBC, which OpenSSL 3 refuses; one OpenSSL 3 can read uses
+AES-256-CBC with a SHA-256 MAC, which makes `security import` fail MAC
+verification. A certificate is public, so committing it sidesteps the conflict
+and lets anyone verify which identity signs the releases. Only the `.p12` and its
+password are secret.
+
 ### Rotating or restoring the certificate
 
 GitHub secrets are write-only, so the 1Password item is the only recoverable

@@ -88,9 +88,18 @@ jobs:
           KEYCHAIN="$WORK/signing.keychain-db"
           trap 'security delete-keychain "$KEYCHAIN" 2>/dev/null || true; rm -rf "$WORK"' EXIT
 
+          # AIDEV-NOTE: the certificate is read from the repo, not extracted
+          # from the .p12, because the two toolchains disagree on PKCS#12
+          # algorithms and there is no format both accept. A p12 macOS can
+          # import uses legacy RC2-40-CBC, which OpenSSL 3 refuses without the
+          # legacy provider; one written with AES-256-CBC and a SHA-256 MAC is
+          # readable by OpenSSL 3 but makes `security import` fail with "MAC
+          # verification failed". Since a certificate is public there is no
+          # reason to derive it from the encrypted bundle at all — this removes
+          # the conflict instead of negotiating it, and makes the signing
+          # identity auditable from the repo.
           printf '%s' "$MACOS_SIGNING_P12" | base64 -d > "$WORK/cert.p12"
-          openssl pkcs12 -in "$WORK/cert.p12" -nokeys \
-            -passin "pass:$MACOS_SIGNING_P12_PASSWORD" -out "$WORK/cert.pem"
+          cp .github/signing-cert.pem "$WORK/cert.pem"
 
           security create-keychain -p "$MACOS_SIGNING_P12_PASSWORD" "$KEYCHAIN"
           security unlock-keychain -p "$MACOS_SIGNING_P12_PASSWORD" "$KEYCHAIN"
