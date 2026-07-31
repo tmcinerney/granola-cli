@@ -1,5 +1,12 @@
 name: CI
 
+# AIDEV-NOTE: third-party actions are pinned to commit SHAs, not tags. A tag is
+# mutable, so `@v2` can be repointed at new code by whoever controls the repo.
+# That matters here because release.yml holds an Apple Developer ID signing key
+# and `contents: write` — a compromised action could sign and publish arbitrary
+# binaries under a trusted identity. The trailing comment records the human
+# version; Dependabot updates both together.
+
 on:
   push:
     branches: [main]
@@ -34,15 +41,15 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: clippy, rustfmt
 
       - name: Cache cargo registry + build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
 
       - name: Format check
         run: cargo fmt --all -- --check
@@ -61,7 +68,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Read rust-version from Cargo.toml
         id: msrv
@@ -75,12 +82,12 @@ jobs:
           echo "version=$V" >> "$GITHUB_OUTPUT"
 
       - name: Install the declared minimum toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
 
       - name: Cache cargo registry + build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
         with:
           key: msrv-${{ steps.msrv.outputs.version }}
 
