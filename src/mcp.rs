@@ -11,6 +11,8 @@
 //! argument shape is flatter, though: FastMCP wrapped a Pydantic model in a
 //! required `params` object, which rmcp's `Parameters<T>` does not.
 
+use std::time::Duration;
+
 use anyhow::Result;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
@@ -231,6 +233,29 @@ pub struct MeetingIdFormatArgs {
     pub reserved: ReservedArgs,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(extend(
+    "additionalProperties" = false,
+    "patternProperties" = serde_json::json!({ "^_": {} })
+))]
+pub struct AuthArgs {
+    /// Output format.
+    #[serde(default)]
+    pub response_format: ResponseFormat,
+    // Never read: its Deserialize impl does the validating, and reserved values
+    // are deliberately discarded. Present so serde routes leftover keys here.
+    #[allow(dead_code)]
+    #[serde(flatten)]
+    pub reserved: ReservedArgs,
+}
+
+/// How long `granola_auth_login` waits before giving up on the import.
+///
+/// AIDEV-NOTE: sits between `exchange_refresh_token`'s own 15s timeout and the
+/// 60s default tool-call timeout in common MCP clients, so a slow network alone
+/// cannot trip it and tripping it cannot look like a client-side hang.
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Clone)]
 pub struct GranolaServer;
 
@@ -239,30 +264,56 @@ pub struct GranolaServer;
 /// AIDEV-NOTE: `api::Client` is synchronous (ureq), so calling it directly from
 /// an async tool handler would block the runtime thread driving the stdio
 /// transport. `spawn_blocking` keeps the transport responsive.
-async fn blocking<T, F>(f: F) -> Result<T, String>
+/// AIDEV-NOTE: the error is returned intact rather than pre-formatted so `reply`
+/// can downcast it. An auth failure needs a recovery sentence appended, and
+/// stringifying here would throw away the type that decides whether to add one.
+async fn blocking<T, F>(f: F) -> Result<T>
 where
     F: FnOnce() -> Result<T> + Send + 'static,
     T: Send + 'static,
 {
     match tokio::task::spawn_blocking(f).await {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(e)) => Err(format!("{e:#}")),
-        Err(e) => Err(format!("granola worker thread failed: {e}")),
+        Ok(result) => result,
+        Err(e) => Err(anyhow::anyhow!("granola worker thread failed: {e}")),
     }
 }
 
 /// AIDEV-NOTE: tool failures are reported as `Ok(CallToolResult::error(..))`,
 /// not `Err(ErrorData)`. MCP clients render protocol errors opaquely ("tool
-/// result missing"), so an `Err` would hide the message — including
-/// `api::Error::Unauthenticated`, whose text tells the user to run
-/// `granola auth login`. Interactive re-auth is deliberately never attempted:
-/// the server is spawned by a GUI client with no terminal to prompt on.
-fn reply(result: Result<String, String>) -> Result<CallToolResult, ErrorData> {
+/// result missing"), so an `Err` would hide the message — and the message is the
+/// actionable part.
+///
+/// AIDEV-NOTE: re-auth IS attempted, both implicitly (see `api::Recovery`) and on
+/// demand via `granola_auth_login`. This note previously said the opposite, on the
+/// belief that credential import needs a terminal. It does not: import is local
+/// file I/O plus, on a migrated install, one refresh-token POST. That mistaken
+/// belief reached users as "run `granola auth login` in a terminal, it will open a
+/// browser flow" — advice for a flow that does not exist.
+fn reply(result: Result<String>) -> Result<CallToolResult, ErrorData> {
     Ok(match result {
         Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
-        Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
+        Err(e) => {
+            let mut message = format!("{e:#}");
+            if e.downcast_ref::<api::Error>()
+                .is_some_and(api::Error::is_auth_failure)
+            {
+                message.push_str("\n\n");
+                message.push_str(AUTH_RECOVERY_HINT);
+            }
+            CallToolResult::error(vec![ContentBlock::text(message)])
+        }
     })
 }
+
+/// Appended to auth failures on the data tools.
+///
+/// AIDEV-NOTE: deliberately not baked into `api::Error`'s Display, which the CLI
+/// shares — the CLI must say "run `granola auth login`" and this must name a
+/// tool. See the AIDEV-NOTE on `api::RecoveryHint`.
+const AUTH_RECOVERY_HINT: &str =
+    "Call `granola_auth_login` to re-import credentials from the Granola desktop app. \
+     That is a local import, not a browser or device-code flow, so it works in this \
+     session without a terminal. Call `granola_auth_status` first for the specific cause.";
 
 fn meeting_markdown(m: &Value) -> String {
     let title = m
@@ -533,6 +584,138 @@ impl GranolaServer {
             .await,
         )
     }
+
+    #[tool(
+        name = "granola_auth_status",
+        description = "Check whether Granola credentials are present and accepted by the API. \
+                       Reports the specific cause of an auth failure and whether this server \
+                       can repair it itself. Call this when another granola_* tool reports an \
+                       authentication problem.",
+        annotations(
+            title = "Check Granola authentication",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn auth_status(
+        &self,
+        Parameters(args): Parameters<AuthArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        reply(blocking(move || render_auth_report(&api::auth_report(), args.response_format)).await)
+    }
+
+    // AIDEV-NOTE: `read_only_hint` is omitted-as-false on both auth tools, and the
+    // four data tools stay unannotated. read_only_hint = true is what lets a client
+    // auto-approve a call unattended, so it must not be claimed by anything that can
+    // write credentials — and since the data tools refresh and may re-import (see
+    // `api::Recovery`), that now includes them. `granola_auth_login` is not
+    // idempotent either: each import can rotate the credential chain.
+    #[tool(
+        name = "granola_auth_login",
+        description = "Re-import Granola credentials from the Granola desktop app and validate \
+                       them. This is a local import — it reads the desktop app's own credential \
+                       files and may exchange a refresh token — not a browser or device-code \
+                       flow, so it needs no terminal and no user interaction. Call it when \
+                       granola_auth_status reports stale or missing credentials.",
+        annotations(
+            title = "Re-import Granola credentials",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn auth_login(
+        &self,
+        Parameters(args): Parameters<AuthArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // AIDEV-NOTE: `spawn_blocking` cannot be cancelled, so on timeout the
+        // import keeps running until the Keychain dialog is answered. That is
+        // safe: it holds the refresh lock for its duration, so a later explicit
+        // retry queues behind it rather than racing it, and if the dialog is
+        // eventually approved the credentials it saves are simply already there.
+        let report = match tokio::time::timeout(
+            LOGIN_TIMEOUT,
+            tokio::task::spawn_blocking(api::authenticate),
+        )
+        .await
+        {
+            Ok(Ok(report)) => report,
+            Ok(Err(e)) => {
+                return reply(Err(anyhow::anyhow!("granola worker thread failed: {e}")));
+            }
+            Err(_elapsed) => api::import_timed_out(),
+        };
+        reply(render_auth_report(&report, args.response_format))
+    }
+}
+
+/// Render an `AuthReport` for an MCP caller, with the recovery step phrased as
+/// something the agent can act on.
+fn render_auth_report(report: &api::AuthReport, format: ResponseFormat) -> Result<String> {
+    let next_step = mcp_recovery_text(report.recovery);
+    Ok(match format {
+        ResponseFormat::Json => {
+            let mut value = serde_json::to_value(report)?;
+            if let (Some(obj), Some(next)) = (value.as_object_mut(), next_step) {
+                obj.insert("next_step".into(), Value::String(next.into()));
+            }
+            serde_json::to_string_pretty(&value)?
+        }
+        ResponseFormat::Markdown => {
+            let mut out = format!(
+                "# Granola authentication\n\n- **Status**: {}\n- **Code**: `{}`\n\n{}\n",
+                if report.ok { "ok" } else { "not working" },
+                report.code,
+                report.message
+            );
+            if let Some(next) = next_step {
+                out.push_str(&format!("\n**Next step**: {next}\n"));
+            }
+            out
+        }
+    })
+}
+
+/// The MCP server's phrasing of a `RecoveryHint` — names tools, not shell
+/// commands, except where a human at the machine genuinely is required.
+fn mcp_recovery_text(hint: api::RecoveryHint) -> Option<&'static str> {
+    match hint {
+        api::RecoveryHint::None => None,
+        // AIDEV-NOTE: deliberately says nothing about terminals. Mentioning one
+        // even to rule it out invites an agent to relay it as a step, which is
+        // the failure this whole change exists to prevent — and a test asserts
+        // the word is absent from any hint the server can act on itself.
+        api::RecoveryHint::Reimport => Some(
+            "Call `granola_auth_login`. It re-imports from the Granola desktop app in this \
+             session: a local file import, not a browser or device-code flow.",
+        ),
+        api::RecoveryHint::SignInToDesktop => Some(
+            "The Granola desktop app has no credentials to import. Ask the user to open Granola \
+             and sign in, then call `granola_auth_login`.",
+        ),
+        // The one case that genuinely cannot be automated: macOS will hold a GUI
+        // dialog for Granola's own Keychain item until a person answers it.
+        api::RecoveryHint::ApproveKeychain => Some(
+            "macOS needs one-time approval to release Granola's encryption key, which only the \
+             user can give. Ask them to run `granola auth login` once in a terminal and approve \
+             the Keychain prompt; after that this server can re-import on its own.",
+        ),
+        api::RecoveryHint::FixKeychainAccess => Some(
+            "This server cannot read the OS keychain, so it cannot recover on its own. Ask the \
+             user to run `granola auth status` in a terminal to see the underlying error.",
+        ),
+        api::RecoveryHint::Retry => {
+            Some("Granola's API could not be reached. Retry the original tool call shortly.")
+        }
+        api::RecoveryHint::DeadEnd => Some(
+            "No local credential source remains to import from, so neither this server nor the \
+             CLI can recover. The Granola desktop app has to write fresh credentials first — ask \
+             the user to sign out and back in to Granola desktop.",
+        ),
+    }
 }
 
 fn context_markdown(context: &Value) -> String {
@@ -605,7 +788,13 @@ fn context_markdown(context: &Value) -> String {
                     granola_get_notes for the enhanced notes, granola_get_transcript for the \
                     full transcript, or granola_get_meeting_context for a compact summary with \
                     conservative speaker attribution. Transcript `source` names an audio \
-                    channel rather than a person, so do not treat it as a speaker identity."
+                    channel rather than a person, so do not treat it as a speaker identity. \
+                    Authentication repairs itself: a rejected credential is re-imported from the \
+                    Granola desktop app automatically. If a tool still reports an auth failure, \
+                    call granola_auth_status for the cause and granola_auth_login to re-import. \
+                    Do not tell the user to run `granola auth login` in a terminal unless a \
+                    tool's own next_step says so — credential import is local file I/O, not a \
+                    browser flow, and this server can do it itself."
 )]
 impl ServerHandler for GranolaServer {}
 
@@ -625,7 +814,108 @@ pub fn run() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ListMeetingsArgs, NotesArgs, ResponseFormat};
+    use super::{
+        mcp_recovery_text, render_auth_report, AuthArgs, ListMeetingsArgs, NotesArgs,
+        ResponseFormat,
+    };
+    use crate::api;
+
+    fn report(code: &'static str, recovery: api::RecoveryHint) -> api::AuthReport {
+        api::AuthReport {
+            ok: false,
+            code,
+            message: "Stored credentials were rejected by Granola.".into(),
+            credentials_present: true,
+            validated: false,
+            source: None,
+            desktop: crate::auth::DesktopState {
+                plaintext_files: vec!["stored-accounts.json".into()],
+                encrypted_files: Vec::new(),
+                storage_dek_present: false,
+                plaintext_refresh_token_present: true,
+                needs_cross_app_keychain: false,
+            },
+            recovery,
+        }
+    }
+
+    /// The auth tools take the same validated-argument shape as the data tools.
+    #[test]
+    fn auth_args_accept_the_documented_shape_and_reject_typos() {
+        let args: AuthArgs = serde_json::from_str(r#"{"response_format":"markdown"}"#)
+            .expect("the documented flat shape must deserialise");
+        assert!(matches!(args.response_format, ResponseFormat::Markdown));
+
+        // Everything optional, and json is the default.
+        let defaults: AuthArgs = serde_json::from_str("{}").expect("all fields optional");
+        assert!(matches!(defaults.response_format, ResponseFormat::Json));
+
+        // Same guards as every other tool: reserved keys through, typos out.
+        assert!(serde_json::from_str::<AuthArgs>(r#"{"_meta":{}}"#).is_ok());
+        assert!(serde_json::from_str::<AuthArgs>(r#"{"responseFormat":"json"}"#).is_err());
+        assert!(serde_json::from_str::<AuthArgs>(r#"{"params":{}}"#).is_err());
+    }
+
+    /// A state the server can repair must not be reported to the agent as
+    /// something the user has to do in a terminal. That mistake is the reason
+    /// these tools exist, so it is asserted rather than left to review.
+    ///
+    /// The check is for the bare word, not the instruction form: an agent
+    /// relaying "no terminal needed" to a user is nearly as unhelpful as telling
+    /// them to open one, so a self-repairable hint should not raise the subject.
+    #[test]
+    fn a_self_repairable_state_never_tells_the_agent_to_use_a_terminal() {
+        let text = mcp_recovery_text(api::RecoveryHint::Reimport).expect("a hint");
+        assert!(text.contains("granola_auth_login"), "{text}");
+        for banned in ["terminal", "browser flow", "sign in", "log in"] {
+            assert!(!text.to_lowercase().contains(banned), "{banned:?}: {text}");
+        }
+    }
+
+    /// The converse: the two states that genuinely need a person at the machine
+    /// must say so, rather than sending the agent round a loop it cannot exit.
+    #[test]
+    fn states_needing_a_human_say_so() {
+        for hint in [
+            api::RecoveryHint::ApproveKeychain,
+            api::RecoveryHint::FixKeychainAccess,
+        ] {
+            let text = mcp_recovery_text(hint).expect("a hint");
+            assert!(text.contains("terminal"), "{hint:?} should defer: {text}");
+        }
+    }
+
+    #[test]
+    fn a_working_state_suggests_nothing() {
+        assert!(mcp_recovery_text(api::RecoveryHint::None).is_none());
+    }
+
+    #[test]
+    fn rendered_reports_carry_the_code_and_the_next_step() {
+        let report = report(api::codes::STALE_CREDENTIALS, api::RecoveryHint::Reimport);
+
+        let json = render_auth_report(&report, ResponseFormat::Json).expect("render json");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(parsed["code"], "stale_credentials");
+        assert_eq!(parsed["recovery"], "reimport");
+        assert!(parsed["next_step"]
+            .as_str()
+            .expect("next_step")
+            .contains("granola_auth_login"));
+
+        let markdown = render_auth_report(&report, ResponseFormat::Markdown).expect("render md");
+        assert!(markdown.contains("stale_credentials"), "{markdown}");
+        assert!(markdown.contains("Next step"), "{markdown}");
+    }
+
+    #[test]
+    fn a_healthy_report_renders_without_a_next_step() {
+        let mut healthy = report(api::codes::OK, api::RecoveryHint::None);
+        healthy.ok = true;
+        let json = render_auth_report(&healthy, ResponseFormat::Json).expect("render json");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert!(parsed.get("next_step").is_none(), "{json}");
+    }
 
     /// MCP reserves `_meta`, and a leading underscore cannot collide with a real
     /// argument — so reserved keys pass through and are ignored, while anything
