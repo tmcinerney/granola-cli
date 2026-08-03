@@ -27,9 +27,7 @@ use pbkdf2::pbkdf2_hmac;
 use sha1::Sha1;
 use std::fs::{File, OpenOptions};
 use std::io;
-#[cfg(target_os = "macos")]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use directories::{BaseDirs, ProjectDirs};
@@ -64,9 +62,17 @@ const GRANOLA_STORAGE_IV_LENGTH: usize = 12;
 #[cfg(any(target_os = "macos", test))]
 const GRANOLA_STORAGE_AUTH_TAG_LENGTH: usize = 16;
 
+// Names of the credential files the Granola desktop app writes. Named because
+// `desktop_state_at` probes the same set the import paths read, and a drifting
+// literal there would misreport which recovery is possible.
+const STORED_ACCOUNTS_FILE: &str = "stored-accounts.json";
+const SUPABASE_FILE: &str = "supabase.json";
+const ENCRYPTED_STORED_ACCOUNTS_FILE: &str = "stored-accounts.json.enc";
+const ENCRYPTED_SUPABASE_FILE: &str = "supabase.json.enc";
+const STORAGE_DEK_FILE: &str = "storage.dek";
+
 #[cfg(any(target_os = "macos", test))]
 type Aes128CbcDec = Decryptor<Aes128>;
-#[cfg(target_os = "macos")]
 type CredentialParser = fn(&str) -> Option<Credentials>;
 
 #[derive(Debug, thiserror::Error)]
@@ -79,7 +85,9 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("network: {0}")]
     Http(#[from] Box<ureq::Error>),
-    #[error("no credentials in keychain — run `granola auth login`")]
+    // Front-end neutral: this text reaches both a terminal user and an MCP
+    // agent, and they recover differently. See `api::RecoveryHint`.
+    #[error("no usable credentials in the OS keychain")]
     NoCredentials,
     #[error("refresh token rejected by authentication provider (HTTP {status})")]
     RefreshRejected { status: u16 },
@@ -240,46 +248,137 @@ pub fn parse_supabase(json: &str) -> Option<Credentials> {
     })
 }
 
-fn granola_file(name: &str) -> Option<PathBuf> {
+fn granola_dir() -> Option<PathBuf> {
     let base = BaseDirs::new()?;
-    // macOS: ~/Library/Application Support/Granola/<name>
-    // Windows: %APPDATA%/Granola/<name>
-    // Linux: ~/.config/granola/<name>
+    // macOS: ~/Library/Application Support/Granola/
+    // Windows: %APPDATA%/Granola/
+    // Linux: ~/.config/granola/
     #[cfg(target_os = "macos")]
-    let path = base
+    let dir = base
         .home_dir()
         .join("Library")
         .join("Application Support")
-        .join("Granola")
-        .join(name);
+        .join("Granola");
     #[cfg(target_os = "windows")]
-    let path = base.config_dir().join("Granola").join(name);
+    let dir = base.config_dir().join("Granola");
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let path = base.home_dir().join(".config").join("granola").join(name);
-    Some(path)
+    let dir = base.home_dir().join(".config").join("granola");
+    Some(dir)
+}
+
+fn granola_file(name: &str) -> Option<PathBuf> {
+    Some(granola_dir()?.join(name))
 }
 
 pub fn stored_accounts_path() -> Option<PathBuf> {
-    granola_file("stored-accounts.json")
+    granola_file(STORED_ACCOUNTS_FILE)
 }
 
 pub fn supabase_path() -> Option<PathBuf> {
-    granola_file("supabase.json")
+    granola_file(SUPABASE_FILE)
 }
 
 #[cfg(target_os = "macos")]
 pub fn encrypted_stored_accounts_path() -> Option<PathBuf> {
-    granola_file("stored-accounts.json.enc")
+    granola_file(ENCRYPTED_STORED_ACCOUNTS_FILE)
 }
 
 #[cfg(target_os = "macos")]
 pub fn encrypted_supabase_path() -> Option<PathBuf> {
-    granola_file("supabase.json.enc")
+    granola_file(ENCRYPTED_SUPABASE_FILE)
 }
 
 #[cfg(target_os = "macos")]
 pub fn storage_dek_path() -> Option<PathBuf> {
-    granola_file("storage.dek")
+    granola_file(STORAGE_DEK_FILE)
+}
+
+// ---- Desktop state probe ----------------------------------------------------
+
+/// Which Granola desktop credential sources exist on disk.
+///
+/// AIDEV-NOTE: presence only — never token values. This is serialised into
+/// `granola auth status` and `granola_auth_status` output, and it is the
+/// diagnostic that says *which* recovery is possible. Reporting it is the point:
+/// without it a dead bootstrap token and a transient 401 look identical, which
+/// is how "run `granola auth login`, it opens a browser flow" became the advice
+/// given for a state no browser flow exists for.
+///
+/// Every field exists on every platform so the JSON shape cannot fork across
+/// the Linux/Windows/macOS CI matrix. The fields state file facts only; whether
+/// a given import path applies is the caller's judgement, because the encrypted
+/// and bootstrap paths are macOS-only.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DesktopState {
+    /// Plaintext credential files present.
+    pub plaintext_files: Vec<String>,
+    /// Encrypted (`*.enc`) credential files present.
+    pub encrypted_files: Vec<String>,
+    /// Whether `storage.dek` sits beside the encrypted files. Absent means
+    /// Granola has moved its key into app-only Keychain storage.
+    pub storage_dek_present: bool,
+    /// Whether a plaintext file still carries a non-empty refresh token — what
+    /// the post-migration bootstrap exchanges.
+    pub plaintext_refresh_token_present: bool,
+    /// Whether importing would have to decrypt the DEK through Granola's own
+    /// Keychain item, which blocks on a GUI dialog until answered.
+    pub needs_cross_app_keychain: bool,
+}
+
+/// `DesktopState` for an explicit directory. Split out so it is testable
+/// without a `$HOME` that happens to contain a Granola install.
+fn desktop_state_at(dir: &Path) -> DesktopState {
+    let present = |name: &str| dir.join(name).is_file();
+    let existing = |names: &[&str]| -> Vec<String> {
+        names
+            .iter()
+            .filter(|n| present(n))
+            .map(|n| (*n).to_string())
+            .collect()
+    };
+
+    let encrypted_files = existing(&[ENCRYPTED_STORED_ACCOUNTS_FILE, ENCRYPTED_SUPABASE_FILE]);
+    let storage_dek_present = present(STORAGE_DEK_FILE);
+
+    DesktopState {
+        plaintext_files: existing(&[STORED_ACCOUNTS_FILE, SUPABASE_FILE]),
+        // AIDEV-NOTE: the cross-app Keychain read happens only when there is
+        // something encrypted to decrypt *and* a wrapped DEK to unwrap. With
+        // `.enc` files but no `storage.dek`, `load_encrypted_credentials_from_file`
+        // returns DesktopKeyMigrated before touching the Keychain — so that state
+        // cannot raise a dialog, and implicit recovery is safe there.
+        needs_cross_app_keychain: !encrypted_files.is_empty() && storage_dek_present,
+        encrypted_files,
+        storage_dek_present,
+        plaintext_refresh_token_present: plaintext_refresh_token_at(dir),
+    }
+}
+
+/// Whether either plaintext file parses to a non-empty refresh token.
+///
+/// Mirrors what `load_legacy_refresh_credentials` accepts, without returning the
+/// token or the paths it tried.
+fn plaintext_refresh_token_at(dir: &Path) -> bool {
+    let candidates: [(&str, CredentialParser); 2] = [
+        (STORED_ACCOUNTS_FILE, parse_stored_accounts),
+        (SUPABASE_FILE, parse_supabase),
+    ];
+    candidates.iter().any(|(name, parse)| {
+        std::fs::read_to_string(dir.join(name))
+            .ok()
+            .and_then(|content| parse(&content))
+            .is_some_and(|creds| !creds.refresh_token.is_empty())
+    })
+}
+
+/// `DesktopState` for the real Granola application-support directory.
+pub fn desktop_state() -> DesktopState {
+    match granola_dir() {
+        Some(dir) => desktop_state_at(&dir),
+        // No home directory: nothing is discoverable, which is what an
+        // all-empty state already says.
+        None => desktop_state_at(Path::new("")),
+    }
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -648,14 +747,66 @@ fn with_refresh_lock<T>(f: impl FnOnce() -> Result<T, Error>) -> Result<T, Error
 /// Exchange a leftover plaintext refresh token after Granola migrates its DEK
 /// into an app-only Keychain access group, then persist the rotated credential
 /// pair before returning its access token to the caller.
+///
+/// Assumes the refresh lock is held; see `login`.
 #[cfg(target_os = "macos")]
-pub fn bootstrap_migrated_credentials() -> Result<Credentials, Error> {
-    with_refresh_lock(|| {
-        let creds = load_legacy_refresh_credentials()?;
-        let new_creds = exchange_refresh_token(&creds)?;
-        save_credentials(&new_creds)?;
-        Ok(new_creds)
-    })
+fn bootstrap_migrated_credentials_locked() -> Result<Credentials, Error> {
+    let creds = load_legacy_refresh_credentials()?;
+    let new_creds = exchange_refresh_token(&creds)?;
+    save_credentials(&new_creds)?;
+    Ok(new_creds)
+}
+
+/// Where a set of credentials came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialSource {
+    /// Already in the OS keychain.
+    Keychain,
+    /// Imported from the Granola desktop app's credential files.
+    DesktopImport,
+    /// Obtained by exchanging a leftover plaintext refresh token after Granola
+    /// moved its desktop encryption key into app-only Keychain storage.
+    Bootstrap,
+}
+
+/// Import credentials from the Granola desktop app and persist them.
+///
+/// Assumes the refresh lock is held.
+fn login_locked() -> Result<(Credentials, CredentialSource), Error> {
+    match load_credentials_from_file() {
+        Ok(creds) => {
+            save_credentials(&creds)?;
+            Ok((creds, CredentialSource::DesktopImport))
+        }
+        // AIDEV-NOTE: gated because both the variant and the bootstrap it calls
+        // are macOS-only. An ungated arm fails the Linux/Windows CI legs, which
+        // build with `-D warnings`.
+        #[cfg(target_os = "macos")]
+        Err(Error::DesktopKeyMigrated) => Ok((
+            bootstrap_migrated_credentials_locked()?,
+            CredentialSource::Bootstrap,
+        )),
+        Err(e) => Err(e),
+    }
+}
+
+/// Re-import credentials from the Granola desktop app, persist them, and report
+/// which path supplied them.
+///
+/// AIDEV-NOTE: this is deliberately not a browser or device-code flow — it is
+/// local file I/O plus, on a migrated install, one refresh-token POST. That is
+/// what makes it callable from `granola mcp`, which has no terminal. Do not
+/// reintroduce a "must be run interactively" claim here.
+///
+/// AIDEV-NOTE: the whole read-import-save sequence holds the refresh lock, so it
+/// cannot interleave with `refresh_access_token` in another process, and two
+/// concurrent MCP `granola_auth_login` calls cannot stack Keychain prompts.
+/// Everything it calls must therefore be the non-locking `*_locked` form —
+/// `fd_lock` opens a fresh fd per acquisition, so a nested `with_refresh_lock`
+/// in the same process deadlocks against itself rather than reentering.
+pub fn login() -> Result<(Credentials, CredentialSource), Error> {
+    with_refresh_lock(login_locked)
 }
 
 /// Refresh the access token via Granola's desktop refresh proxy. The returned
@@ -726,6 +877,134 @@ mod tests {
         blob.extend_from_slice(&encrypted);
         blob.extend_from_slice(tag.as_slice());
         blob
+    }
+
+    /// A scratch directory that cleans itself up, so `desktop_state_at` can be
+    /// tested without a `$HOME` that happens to contain a real Granola install.
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "granola-cli-desktop-state-{}-{name}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create scratch dir");
+            ScratchDir(dir)
+        }
+
+        fn write(&self, name: &str, contents: &str) {
+            std::fs::write(self.0.join(name), contents).expect("write scratch file");
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn plaintext_stored_accounts(refresh_token: &str) -> String {
+        let tokens = serde_json::json!({
+            "access_token": "AT_PLAINTEXT",
+            "refresh_token": refresh_token,
+            "client_id": "client_GranolaMac",
+        });
+        let accounts = serde_json::json!([{ "userId": "u1", "tokens": tokens }]);
+        serde_json::json!({ "accounts": accounts }).to_string()
+    }
+
+    #[test]
+    fn desktop_state_reports_nothing_for_an_empty_directory() {
+        let dir = ScratchDir::new("empty");
+        let state = desktop_state_at(dir.path());
+
+        assert!(state.plaintext_files.is_empty());
+        assert!(state.encrypted_files.is_empty());
+        assert!(!state.storage_dek_present);
+        assert!(!state.plaintext_refresh_token_present);
+        assert!(!state.needs_cross_app_keychain);
+    }
+
+    #[test]
+    fn desktop_state_reports_a_plaintext_only_install() {
+        let dir = ScratchDir::new("plaintext");
+        dir.write(STORED_ACCOUNTS_FILE, &plaintext_stored_accounts("RT_LIVE"));
+        let state = desktop_state_at(dir.path());
+
+        assert_eq!(state.plaintext_files, vec![STORED_ACCOUNTS_FILE]);
+        assert!(state.plaintext_refresh_token_present);
+        // Nothing encrypted, so importing never reads Granola's Keychain item.
+        assert!(!state.needs_cross_app_keychain);
+    }
+
+    /// The pre-migration encrypted layout: importing has to unwrap the DEK
+    /// through Granola's own Keychain item, which can block on a GUI dialog.
+    #[test]
+    fn desktop_state_flags_the_cross_app_keychain_read_when_a_dek_is_present() {
+        let dir = ScratchDir::new("dek");
+        dir.write(ENCRYPTED_STORED_ACCOUNTS_FILE, "not-really-encrypted");
+        dir.write(ENCRYPTED_SUPABASE_FILE, "not-really-encrypted");
+        dir.write(STORAGE_DEK_FILE, "wrapped-key");
+        let state = desktop_state_at(dir.path());
+
+        assert_eq!(
+            state.encrypted_files,
+            vec![ENCRYPTED_STORED_ACCOUNTS_FILE, ENCRYPTED_SUPABASE_FILE]
+        );
+        assert!(state.storage_dek_present);
+        assert!(state.needs_cross_app_keychain);
+    }
+
+    /// The post-migration layout: encrypted files but no `storage.dek`, with a
+    /// frozen plaintext file left behind. `load_encrypted_credentials_from_file`
+    /// returns DesktopKeyMigrated before reaching the Keychain, so this state
+    /// cannot raise a dialog — which is what makes implicit recovery safe here.
+    #[test]
+    fn desktop_state_does_not_flag_a_keychain_read_once_the_dek_is_gone() {
+        let dir = ScratchDir::new("migrated");
+        dir.write(ENCRYPTED_STORED_ACCOUNTS_FILE, "not-really-encrypted");
+        dir.write(
+            STORED_ACCOUNTS_FILE,
+            &plaintext_stored_accounts("RT_FROZEN"),
+        );
+        let state = desktop_state_at(dir.path());
+
+        assert!(!state.storage_dek_present);
+        assert!(!state.needs_cross_app_keychain);
+        // The bootstrap exchange has something to work with.
+        assert!(state.plaintext_refresh_token_present);
+    }
+
+    #[test]
+    fn desktop_state_ignores_a_plaintext_file_with_no_refresh_token() {
+        let dir = ScratchDir::new("no-refresh");
+        dir.write(STORED_ACCOUNTS_FILE, &plaintext_stored_accounts(""));
+        let state = desktop_state_at(dir.path());
+
+        assert_eq!(state.plaintext_files, vec![STORED_ACCOUNTS_FILE]);
+        assert!(!state.plaintext_refresh_token_present);
+    }
+
+    /// Regression guard: the state probe is serialised into `auth status` and
+    /// `granola_auth_status` output, so it must never carry token values out of
+    /// the files it reads.
+    #[test]
+    fn desktop_state_never_serialises_token_values() {
+        let dir = ScratchDir::new("no-leak");
+        dir.write(
+            STORED_ACCOUNTS_FILE,
+            &plaintext_stored_accounts("SUPER_SECRET_REFRESH"),
+        );
+        let json = serde_json::to_string(&desktop_state_at(dir.path())).expect("serialise");
+
+        assert!(!json.contains("SUPER_SECRET_REFRESH"), "leaked: {json}");
+        assert!(!json.contains("AT_PLAINTEXT"), "leaked: {json}");
     }
 
     #[test]

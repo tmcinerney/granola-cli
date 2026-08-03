@@ -74,14 +74,10 @@ pub fn emit<T: Serialize>(value: &T, format: Format) {
     }
 }
 
-/// JSON error shape on stdout, so agentic skills consuming `--output json`
-/// always parse pure JSON regardless of failure mode.
-pub fn emit_json_error(code: &str, message: &str) {
-    let v = serde_json::json!({
-        "error": { "code": code, "message": message }
-    });
-    println!("{}", serde_json::to_string_pretty(&v).unwrap());
-}
+// AIDEV-NOTE: the `{error: {code, message}}` shape agentic skills parse from
+// `--output json` now comes from `main::emit_auth_report`, which emits it
+// alongside the fuller `AuthReport` fields. It was the only caller of the helper
+// that used to live here.
 
 // ---- Meeting list table -----------------------------------------------------
 
