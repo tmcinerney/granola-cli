@@ -45,7 +45,10 @@ sha1 = "0.11"
 # against it, so keep the schemars major in step with rmcp's when bumping either.
 rmcp = { version = "3", features = ["transport-io"] }
 schemars = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# AIDEV-NOTE: `time` is for the bounded wait around `granola_auth_login` — a
+# credential import can block on a macOS Keychain dialog, and a hung tool call
+# reads to an agent as an opaque timeout rather than something it can act on.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 
 [dev-dependencies]
 pretty_assertions = "1"

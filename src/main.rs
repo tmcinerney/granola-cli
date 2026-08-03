@@ -194,81 +194,19 @@ fn run_auth(cmd: &AuthCmd) -> Result<()> {
     }
 }
 
+/// Re-import credentials from the Granola desktop app.
+///
+/// AIDEV-NOTE: the whole state machine now lives in `api::authenticate`, which
+/// `granola mcp` shares — this is only the renderer. Validation against
+/// /v1/get-workspaces still happens in there, catching the upstream CLI's
+/// silent-success bug where login appears to work but the imported token is
+/// already stale.
 fn auth_login(opts: &OutputOpts) -> Result<()> {
-    // Any client cached from the previous credentials is now stale.
-    api::clear_cached_client();
-    match auth::load_credentials_from_file() {
-        Ok(c) => auth::save_credentials(&c)?,
-        #[cfg(target_os = "macos")]
-        Err(auth::Error::DesktopKeyMigrated) => match auth::bootstrap_migrated_credentials() {
-            Ok(_) => {}
-            Err(auth::Error::RefreshRejected { .. }) => {
-                return emit_error(
-                    opts,
-                    "bootstrap_refresh_rejected",
-                    "Granola rejected the leftover desktop refresh token. This install can no \
-                     longer bootstrap CLI credentials from local desktop state.",
-                )
-            }
-            Err(auth::Error::NoDesktopCredentials { .. }) => {
-                return emit_error(
-                    opts,
-                    "no_bootstrap_credentials",
-                    "Granola moved its encryption key into app-only storage and no leftover \
-                     plaintext refresh token is available for one-time CLI bootstrap.",
-                )
-            }
-            Err(e) => return Err(e.into()),
-        },
-        Err(auth::Error::NoDesktopCredentials { tried }) => {
-            let msg = format!(
-                "could not find Granola credentials on disk. Looked in: {}. \
-                 Is the Granola desktop app installed and signed in?",
-                tried
-                    .iter()
-                    .map(|p| p.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-            return emit_error(opts, "no_desktop_credentials", &msg);
-        }
-        Err(e) => return Err(e.into()),
-    }
-    // Validate by hitting /v1/get-workspaces (the cheapest authenticated call
-    // per the upstream API spec). This catches the silent-success bug the
-    // upstream CLI has — where login appears to succeed but the imported
-    // token is already stale.
-    let validated = api::with_token_refresh(|c| c.get_workspaces());
-    match validated {
-        Ok(_) => emit_message(opts, "ok", "Credentials imported and validated"),
-        Err(e) if is_stale_credentials_error(&e) => emit_error(
-            opts,
-            "stale_credentials",
-            "Imported credentials were rejected by Granola. This usually means \
-             Granola desktop's session is stale. Try re-importing with \
-             `granola auth login` after confirming Granola desktop is signed in.",
-        ),
-        Err(e) => Err(e.into()),
-    }
+    emit_auth_report(opts, &api::authenticate())
 }
 
 fn auth_status(opts: &OutputOpts) -> Result<()> {
-    if auth::get_credentials()?.is_none() {
-        return emit_error(
-            opts,
-            "unauthenticated",
-            "Not logged in. Run `granola auth login`.",
-        );
-    }
-    match api::with_token_refresh(|c| c.get_workspaces()) {
-        Ok(_) => emit_message(opts, "ok", "Authenticated and validated"),
-        Err(e) if is_stale_credentials_error(&e) => emit_error(
-            opts,
-            "stale_credentials",
-            "Credentials in keychain were rejected. Run `granola auth login` to re-import.",
-        ),
-        Err(e) => Err(e.into()),
-    }
+    emit_auth_report(opts, &api::auth_report())
 }
 
 fn auth_logout(opts: &OutputOpts) -> Result<()> {
@@ -277,9 +215,64 @@ fn auth_logout(opts: &OutputOpts) -> Result<()> {
     emit_message(opts, "ok", "Logged out")
 }
 
-fn is_stale_credentials_error(err: &api::Error) -> bool {
-    matches!(err, api::Error::Http { status: 401, .. })
-        || matches!(err, api::Error::Auth(auth::Error::RefreshRejected { .. }))
+/// Render an `AuthReport`, preserving this command's established output shapes:
+/// `{ok, code, message}` on success and a nested `{error: {code, message}}` on
+/// failure, with the new diagnostic fields added alongside rather than replacing
+/// them. Failure still exits non-zero.
+fn emit_auth_report(opts: &OutputOpts, report: &api::AuthReport) -> Result<()> {
+    let next_step = cli_recovery_text(report.recovery);
+
+    if opts.output == Format::Json {
+        let mut value = serde_json::to_value(report)?;
+        if let Some(obj) = value.as_object_mut() {
+            if let Some(next) = next_step {
+                obj.insert("next_step".into(), Value::String(next.into()));
+            }
+            if !report.ok {
+                obj.insert(
+                    "error".into(),
+                    serde_json::json!({ "code": report.code, "message": report.message }),
+                );
+            }
+        }
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else if report.ok {
+        println!("{}", report.message);
+    }
+
+    if report.ok {
+        return Ok(());
+    }
+    // `main` prints this to stderr, so text mode must not have printed it above.
+    match next_step {
+        Some(next) => anyhow::bail!("{} {next}", report.message),
+        None => anyhow::bail!("{}", report.message),
+    }
+}
+
+/// The CLI's phrasing of a `RecoveryHint`. The MCP server has its own — see the
+/// AIDEV-NOTE on `api::RecoveryHint` for why this is not shared text.
+fn cli_recovery_text(hint: api::RecoveryHint) -> Option<&'static str> {
+    match hint {
+        api::RecoveryHint::None => None,
+        api::RecoveryHint::Reimport => {
+            Some("Run `granola auth login` to re-import from the Granola desktop app.")
+        }
+        api::RecoveryHint::SignInToDesktop => {
+            Some("Confirm the Granola desktop app is installed and signed in, then run `granola auth login`.")
+        }
+        api::RecoveryHint::ApproveKeychain => {
+            Some("Run `granola auth login` and approve the Keychain prompt for Granola's key.")
+        }
+        api::RecoveryHint::FixKeychainAccess => {
+            Some("Check that this binary is permitted to read your login keychain.")
+        }
+        api::RecoveryHint::Retry => Some("Try again shortly."),
+        api::RecoveryHint::DeadEnd => Some(
+            "No local credential source remains to import from. Granola desktop must write fresh \
+             credentials before the CLI can pick them up.",
+        ),
+    }
 }
 
 fn emit_message(opts: &OutputOpts, code: &str, message: &str) -> Result<()> {
@@ -294,13 +287,6 @@ fn emit_message(opts: &OutputOpts, code: &str, message: &str) -> Result<()> {
         _ => println!("{message}"),
     }
     Ok(())
-}
-
-fn emit_error(opts: &OutputOpts, code: &str, message: &str) -> Result<()> {
-    if opts.output == Format::Json {
-        output::emit_json_error(code, message);
-    }
-    anyhow::bail!("{message}");
 }
 
 // ---- meeting ---------------------------------------------------------------

@@ -49,6 +49,12 @@ You need the Granola desktop app installed and signed in. The CLI imports
 your credentials from it once, stores them in your OS keychain, and rotates
 them automatically afterwards.
 
+`granola auth login` is a **local import**, not a sign-in: it reads the desktop
+app's credential files and, on a migrated install, exchanges a refresh token. It
+never opens a browser and never prompts for a password, so it works
+non-interactively — including from the MCP server (see
+[Authentication](#authentication)).
+
 ```sh
 granola auth login        # imports credentials from the desktop app
 granola auth status       # validates against the Granola API
@@ -120,15 +126,56 @@ It speaks JSON-RPC over stdin/stdout, so it is meant to be spawned by an MCP
 client rather than run by hand. Credentials are read from the keychain once per
 process and reused, so a long session does not re-read them per tool call.
 
-On macOS you may be prompted for your login password the first time a *new*
-version runs. The release binaries are ad-hoc signed, and their code identity
-changes with every build, so the keychain treats each version as a different
-application and cannot keep an "always allow" grant across upgrades. One prompt
-per version per process is expected; a prompt on every tool call is not. Authentication is shared with the CLI — run
-`granola auth login` once in a terminal and the server uses the same keychain
-credentials, refreshing them automatically. It never prompts for login itself,
-since it has no terminal to prompt on; if credentials are missing it returns an
-error telling you to run `granola auth login`.
+Release binaries are signed with an Apple Developer ID, so their code identity is
+stable across versions and macOS can keep an "always allow" keychain grant. A
+locally built binary is ad-hoc signed and its identity changes with every build,
+so the keychain treats each build as a different application — expect one prompt
+per build there. A prompt on every tool call is not expected in either case.
+
+### Authentication
+
+Authentication is shared with the CLI: the same keychain credentials, refreshed
+automatically. The server can also repair them itself.
+
+Credential import is **local file I/O** — it reads the Granola desktop app's own
+credential files, and on a migrated install exchanges one refresh token. There is
+no browser flow, no device code, and no terminal requirement, which is why the
+server can do it without a human present. If a credential is rejected and the
+refresh token is dead too, the server re-imports from the desktop app and retries
+the original call, so a stale chain usually heals invisibly.
+
+Two cases still need you at the machine, and the tools say so explicitly rather
+than failing opaquely:
+
+- macOS is holding a Keychain dialog for Granola's own encryption key. Run
+  `granola auth login` once in a terminal and approve it; afterwards the server
+  re-imports on its own.
+- The Granola desktop app itself has no usable credentials. Sign in to Granola,
+  then the server can import again.
+
+You do **not** need to restart your MCP client after running `granola auth login`
+in a terminal. A running server holds only the access token in memory; the
+refresh path re-reads the keychain, so the next call picks up the new chain.
+
+#### Limits of automatic recovery
+
+On a macOS install past Granola 7.427's key migration — encrypted `*.enc`
+credential files but no `storage.dek` — every import goes through the **leftover
+plaintext refresh token** Granola wrote before the migration. Granola desktop no
+longer updates that file, so recovery depends on that one frozen token still
+being accepted by Granola's refresh proxy.
+
+If it is ever invalidated, neither the MCP server nor the CLI can recover, and
+the CLI has no access to the app-only encryption key that would let it read the
+current credentials. `granola auth status` reports this as
+`bootstrap_refresh_rejected` with a `dead_end` recovery hint, distinct from a
+transient rejection, so a permanent failure does not read as a retryable one.
+Getting out of it requires Granola desktop to write fresh credentials — in
+practice, signing out and back in.
+
+Run `granola auth status --output json` to see which state an install is in: the
+`desktop` block reports which credential files exist and whether importing needs
+a Keychain approval.
 
 ### Tools
 
@@ -138,6 +185,15 @@ error telling you to run `granola auth login`.
 | `granola_get_notes` | Both your own typed notes and Granola's AI summary, labelled |
 | `granola_get_transcript` | Full transcript, with per-segment speaker where Granola attributed one |
 | `granola_get_meeting_context` | Compact context: calendar window, attendees, per-channel attribution |
+| `granola_auth_status` | Whether credentials exist and are accepted, the specific cause if not, and whether the server can fix it |
+| `granola_auth_login` | Re-imports credentials from the Granola desktop app and validates them |
+
+Every tool reports a machine-readable `code` and a `next_step` on failure, so an
+agent can distinguish "retry", "call `granola_auth_login`", "ask the user to
+approve a Keychain prompt", and "this install can no longer recover" instead of
+treating every failure as one opaque 401. No tool is marked read-only: the data
+tools can rotate the credential chain as a side effect of recovering, so none of
+them is safe to auto-approve unattended.
 
 ### Two kinds of notes
 
