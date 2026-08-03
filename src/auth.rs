@@ -767,6 +767,14 @@ pub enum CredentialSource {
     DesktopImport,
     /// Obtained by exchanging a leftover plaintext refresh token after Granola
     /// moved its desktop encryption key into app-only Keychain storage.
+    ///
+    /// AIDEV-NOTE: only `login_locked`'s macOS arm constructs this, so off macOS
+    /// it is unconstructible and `-D warnings` fails the Linux/Windows CI legs on
+    /// dead_code. Suppressed only on those targets rather than unconditionally, so
+    /// macOS still fails if the bootstrap path ever stops being reachable. The
+    /// variant stays declared everywhere to keep the serialised shape identical
+    /// across platforms.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Bootstrap,
 }
 
