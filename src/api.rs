@@ -172,6 +172,12 @@ impl Client {
                     });
                     continue;
                 }
+                Err(ureq::Error::Transport(t)) if attempt < MAX_RETRIES => {
+                    let delay = BASE_BACKOFF_MS * 2u64.pow(attempt);
+                    thread::sleep(Duration::from_millis(delay));
+                    last_err = Some(Error::Transport(t.to_string()));
+                    continue;
+                }
                 Err(e) => return Err(e.into()),
             }
         }
