@@ -49,7 +49,7 @@ jobs:
           components: clippy, rustfmt
 
       - name: Cache cargo registry + build
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2.9.1
 
       - name: Format check
         run: cargo fmt --all -- --check
@@ -87,7 +87,7 @@ jobs:
           toolchain: ${{ steps.msrv.outputs.version }}
 
       - name: Cache cargo registry + build
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2.9.1
         with:
           key: msrv-${{ steps.msrv.outputs.version }}
 
